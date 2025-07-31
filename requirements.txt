@@ -1,0 +1,10 @@
+pandas
+numpy
+scipy
+alpha_vantage
+requests
+requests-html
+schedule
+scikit-learn
+twelvedata
+flask
