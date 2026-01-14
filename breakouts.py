@@ -350,12 +350,22 @@ def detect_breakouts(
                     "rr": round(rr, 2),
                     "timestamp": timestamp,
                     "fakeout_detected": False,
+                    "retest_confirmed": False,
+                    "retest_quality": 0.0,
                     "pattern": pattern_info["pattern"],
                     "trend_strength": trend_info["strength"],
                     "confidence": pattern_info["confidence"],
                 }
                 sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
-                signals.append(sig)
+                
+                # Check retest if enabled
+                retest_result = enhanced_retest_confirmation(data, sig, cfg)
+                sig["retest_confirmed"] = retest_result["confirmed"]
+                sig["retest_quality"] = retest_result["quality"]
+                
+                # Only add signal if retest confirmed (when enabled)
+                if retest_result["confirmed"]:
+                    signals.append(sig)
 
     for sup in levels["support"]:
         if curr["close"] < sup <= prev["close"] and curr["close"] < curr["open"]:
@@ -374,12 +384,22 @@ def detect_breakouts(
                     "rr": round(rr, 2),
                     "timestamp": timestamp,
                     "fakeout_detected": False,
+                    "retest_confirmed": False,
+                    "retest_quality": 0.0,
                     "pattern": pattern_info["pattern"],
                     "trend_strength": trend_info["strength"],
                     "confidence": pattern_info["confidence"],
                 }
                 sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
-                signals.append(sig)
+                
+                # Check retest if enabled
+                retest_result = enhanced_retest_confirmation(data, sig, cfg)
+                sig["retest_confirmed"] = retest_result["confirmed"]
+                sig["retest_quality"] = retest_result["quality"]
+                
+                # Only add signal if retest confirmed (when enabled)
+                if retest_result["confirmed"]:
+                    signals.append(sig)
 
     # 2️⃣ Pattern breakouts
     if pattern_info["pattern"] and pattern_info["confidence"] > 0.6:
@@ -465,7 +485,7 @@ def detect_breakouts(
 # Retest confirmation
 # ────────────────────────────────────────────────────────────────────────────────
 def confirm_retest(data: pd.DataFrame, signal: Dict) -> bool:
-    """Return True if breakout level has been retested once."""
+    """Return True if breakout level has been retested with quality confirmation."""
     if len(data) < 10:
         return False
 
@@ -473,15 +493,180 @@ def confirm_retest(data: pd.DataFrame, signal: Dict) -> bool:
     level   = signal["entry"]
     atr_ten = calculate_atr(data).iloc[-1]
     tol     = atr_ten * 0.3
+    
+    retest_found = False
+    retest_quality = 0.0
 
-    for _, c in candles.iterrows():
+    for idx, (_, c) in enumerate(candles.iterrows()):
         if signal["direction"] == "long":
+            # Check for pullback to level
             if c["low"] <= level + tol and c["close"] > level:
-                return True
+                retest_found = True
+                
+                # Quality scoring
+                # 1. Candle structure (bullish engulfing or hammer)
+                body = abs(c["close"] - c["open"])
+                lower_wick = c["open"] - c["low"] if c["close"] > c["open"] else c["close"] - c["low"]
+                if lower_wick > body * 1.5:  # Strong rejection wick
+                    retest_quality += 0.3
+                if c["close"] > c["open"]:  # Bullish candle
+                    retest_quality += 0.2
+                
+                # 2. Volume confirmation
+                if "volume" in candles.columns:
+                    avg_vol = candles["volume"].mean()
+                    if c["volume"] > avg_vol * 0.8:  # Decent volume
+                        retest_quality += 0.3
+                
+                # 3. Patience (waited at least 3 candles)
+                if idx >= 3:
+                    retest_quality += 0.2
+                
+                break
         else:
+            # Check for pullback to level (short)
             if c["high"] >= level - tol and c["close"] < level:
-                return True
-    return False
+                retest_found = True
+                
+                # Quality scoring
+                body = abs(c["close"] - c["open"])
+                upper_wick = c["high"] - c["close"] if c["close"] < c["open"] else c["high"] - c["open"]
+                if upper_wick > body * 1.5:  # Strong rejection wick
+                    retest_quality += 0.3
+                if c["close"] < c["open"]:  # Bearish candle
+                    retest_quality += 0.2
+                
+                # Volume confirmation
+                if "volume" in candles.columns:
+                    avg_vol = candles["volume"].mean()
+                    if c["volume"] > avg_vol * 0.8:
+                        retest_quality += 0.3
+                
+                # Patience
+                if idx >= 3:
+                    retest_quality += 0.2
+                
+                break
+    
+    # Return True only if retest found and quality is good (>= 0.6)
+    return retest_found and retest_quality >= 0.6
+
+
+def enhanced_retest_confirmation(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict:
+    """
+    Enhanced retest confirmation with detailed analysis.
+    Returns dict with retest status, quality score, and details.
+    """
+    if not cfg.get("retest_enabled", False):
+        return {"confirmed": True, "quality": 1.0, "reason": "retest_disabled"}
+    
+    if len(data) < cfg.get("retest_patience_candles", 10):
+        return {"confirmed": False, "quality": 0.0, "reason": "insufficient_data"}
+    
+    patience_candles = cfg.get("retest_patience_candles", 10)
+    max_distance_atr = cfg.get("retest_max_distance_atr", 0.5)
+    min_quality = cfg.get("retest_min_quality_score", 0.6)
+    
+    candles = data.tail(patience_candles)
+    level = signal["entry"]
+    atr = calculate_atr(data).iloc[-1]
+    tolerance = atr * max_distance_atr
+    
+    best_retest_quality = 0.0
+    retest_candle_idx = -1
+    
+    for idx, (_, c) in enumerate(candles.iterrows()):
+        quality = 0.0
+        is_retest = False
+        
+        if signal["direction"] == "long":
+            # Long retest: price dips to level then bounces
+            if c["low"] <= level + tolerance and c["close"] > level:
+                is_retest = True
+                
+                # Quality factors
+                body = abs(c["close"] - c["open"])
+                lower_wick = min(c["open"], c["close"]) - c["low"]
+                total_range = c["high"] - c["low"]
+                
+                # 1. Rejection wick (30%)
+                if total_range > 0:
+                    wick_ratio = lower_wick / total_range
+                    quality += min(wick_ratio * 0.6, 0.3)
+                
+                # 2. Bullish close (20%)
+                if c["close"] > c["open"]:
+                    quality += 0.2
+                
+                # 3. Volume (25%)
+                if "volume" in candles.columns and candles["volume"].sum() > 0:
+                    avg_vol = candles["volume"].mean()
+                    vol_ratio = c["volume"] / avg_vol if avg_vol > 0 else 0
+                    quality += min(vol_ratio * 0.25, 0.25)
+                
+                # 4. Patience bonus (15%)
+                patience_ratio = idx / patience_candles
+                quality += patience_ratio * 0.15
+                
+                # 5. Distance from level (10%)
+                distance = abs(c["low"] - level)
+                distance_score = max(0, 1 - (distance / tolerance))
+                quality += distance_score * 0.1
+                
+        else:
+            # Short retest: price rises to level then drops
+            if c["high"] >= level - tolerance and c["close"] < level:
+                is_retest = True
+                
+                body = abs(c["close"] - c["open"])
+                upper_wick = c["high"] - max(c["open"], c["close"])
+                total_range = c["high"] - c["low"]
+                
+                # Quality factors
+                if total_range > 0:
+                    wick_ratio = upper_wick / total_range
+                    quality += min(wick_ratio * 0.6, 0.3)
+                
+                if c["close"] < c["open"]:
+                    quality += 0.2
+                
+                if "volume" in candles.columns and candles["volume"].sum() > 0:
+                    avg_vol = candles["volume"].mean()
+                    vol_ratio = c["volume"] / avg_vol if avg_vol > 0 else 0
+                    quality += min(vol_ratio * 0.25, 0.25)
+                
+                patience_ratio = idx / patience_candles
+                quality += patience_ratio * 0.15
+                
+                distance = abs(c["high"] - level)
+                distance_score = max(0, 1 - (distance / tolerance))
+                quality += distance_score * 0.1
+        
+        if is_retest and quality > best_retest_quality:
+            best_retest_quality = quality
+            retest_candle_idx = idx
+    
+    if best_retest_quality >= min_quality:
+        return {
+            "confirmed": True,
+            "quality": best_retest_quality,
+            "candle_index": retest_candle_idx,
+            "reason": f"quality_retest_{best_retest_quality:.2f}"
+        }
+    elif best_retest_quality > 0:
+        return {
+            "confirmed": False,
+            "quality": best_retest_quality,
+            "candle_index": retest_candle_idx,
+            "reason": f"low_quality_{best_retest_quality:.2f}"
+        }
+    else:
+        return {
+            "confirmed": False,
+            "quality": 0.0,
+            "candle_index": -1,
+            "reason": "no_retest_found"
+        }
 
 
 # ────────────────────────────────────────────────────────────────────────────────

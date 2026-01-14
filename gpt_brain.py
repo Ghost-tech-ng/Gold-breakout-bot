@@ -164,45 +164,79 @@ class MarketAnalyzer:
         }
 
     def get_market_session(self) -> str:
-        """Get current market session."""
+        """Get current market session with overlap detection."""
         current_hour = datetime.utcnow().hour
-
-        if self.market_sessions["asian"][
-                "start"] <= current_hour < self.market_sessions["asian"]["end"]:
+        
+        # Check for overlap periods first (highest priority)
+        # London-NY overlap: 13:00-16:00 UTC
+        if 13 <= current_hour < 16:
+            return "overlap"
+        
+        # Individual sessions
+        if self.market_sessions["asian"]["start"] <= current_hour < self.market_sessions["asian"]["end"]:
             return "asian"
-        elif self.market_sessions["london"][
-                "start"] <= current_hour < self.market_sessions["london"][
-                    "end"]:
+        elif self.market_sessions["london"]["start"] <= current_hour < self.market_sessions["london"]["end"]:
             return "london"
-        elif self.market_sessions["new_york"][
-                "start"] <= current_hour < self.market_sessions["new_york"][
-                    "end"]:
+        elif self.market_sessions["new_york"]["start"] <= current_hour < self.market_sessions["new_york"]["end"]:
             return "new_york"
         else:
             return "off_hours"
 
-    def check_news_events(self) -> Dict:
-        """Check for upcoming high-impact news events."""
-        # This would integrate with a news API in production
-        # For now, return a simple structure
+    def check_news_events(self, blackout_minutes: int = 30) -> Dict:
+        """Check for upcoming high-impact news events with time-based detection."""
         current_time = datetime.utcnow()
-
-        # Simulate news check - in production, integrate with ForexFactory API
-        high_impact_times = [{
-            "time": "08:30",
-            "event": "US NFP",
-            "impact": "high"
-        }, {
-            "time": "14:00",
-            "event": "FOMC",
-            "impact": "high"
-        }, {
-            "time": "12:30",
-            "event": "US CPI",
-            "impact": "high"
-        }]
-
-        return {"has_news": False, "next_event": None, "impact": "none"}
+        current_hour = current_time.hour
+        current_minute = current_time.minute
+        current_weekday = current_time.weekday()  # 0=Monday, 6=Sunday
+        
+        # Skip weekends
+        if current_weekday >= 5:  # Saturday or Sunday
+            return {"has_news": False, "next_event": None, "impact": "none", "reason": "weekend"}
+        
+        # High-impact news times (UTC) - typical economic calendar
+        high_impact_times = [
+            # US Data (12:30 UTC) - NFP, CPI, Retail Sales, etc.
+            {"hour": 12, "minute": 30, "event": "US Economic Data", "days": [4]},  # Usually Friday for NFP
+            {"hour": 12, "minute": 30, "event": "US CPI/PPI", "days": [1, 2, 3, 4]},  # Mid-week
+            
+            # FOMC (14:00 UTC) - Usually Wednesday
+            {"hour": 14, "minute": 0, "event": "FOMC Decision", "days": [2]},
+            
+            # UK Data (08:30 UTC)
+            {"hour": 8, "minute": 30, "event": "UK Economic Data", "days": [0, 1, 2, 3, 4]},
+            
+            # ECB (12:45 UTC) - Usually Thursday
+            {"hour": 12, "minute": 45, "event": "ECB Decision", "days": [3]},
+            
+            # US Fed Speeches (18:00 UTC)
+            {"hour": 18, "minute": 0, "event": "Fed Speech", "days": [0, 1, 2, 3, 4]},
+        ]
+        
+        # Check if current time is within blackout window of any event
+        for event in high_impact_times:
+            # Check if event is scheduled for today
+            if current_weekday not in event["days"]:
+                continue
+            
+            event_hour = event["hour"]
+            event_minute = event["minute"]
+            
+            # Calculate time difference in minutes
+            event_time_minutes = event_hour * 60 + event_minute
+            current_time_minutes = current_hour * 60 + current_minute
+            time_diff = abs(event_time_minutes - current_time_minutes)
+            
+            # If within blackout window
+            if time_diff <= blackout_minutes:
+                return {
+                    "has_news": True,
+                    "next_event": event["event"],
+                    "impact": "high",
+                    "time_to_event": event_time_minutes - current_time_minutes,
+                    "reason": f"Within {blackout_minutes}min of {event['event']}"
+                }
+        
+        return {"has_news": False, "next_event": None, "impact": "none", "reason": "clear"}
 
 
 # Global analyzer instance
@@ -301,28 +335,40 @@ def get_market_sentiment(data: pd.DataFrame) -> Dict:
         }
 
 
-def should_skip_news() -> bool:
+def should_skip_news(config: Dict = None) -> bool:
     """Check if current time is near high-impact news."""
     try:
-        news_info = analyzer.check_news_events()
-        return news_info.get("has_news",
-                             False) and news_info.get("impact") == "high"
-    except:
+        blackout_minutes = config.get("news_blackout_minutes", 30) if config else 30
+        news_info = analyzer.check_news_events(blackout_minutes)
+        
+        if news_info.get("has_news", False) and news_info.get("impact") == "high":
+            print(f"📰 News blackout active: {news_info.get('reason', 'Unknown')}")
+            return True
+        
+        return False
+    except Exception as e:
+        print(f"⚠️ Error checking news events: {e}")
         return False
 
 
-def get_trading_session_multiplier() -> float:
-    """Get multiplier based on current trading session."""
+def get_trading_session_multiplier(config: Dict = None) -> tuple[float, str]:
+    """Get multiplier based on current trading session from config."""
     session = analyzer.get_market_session()
-
-    multipliers = {
-        "london": 1.2,  # High activity
-        "new_york": 1.1,  # High activity
-        "asian": 0.9,  # Medium activity
-        "off_hours": 0.7  # Low activity
-    }
-
-    return multipliers.get(session, 1.0)
+    
+    # Get multipliers from config or use defaults
+    if config and "session_multipliers" in config:
+        multipliers = config["session_multipliers"]
+    else:
+        multipliers = {
+            "asian": 0.8,
+            "london": 1.0,
+            "new_york": 1.1,
+            "overlap": 1.15,
+            "off_hours": 0.7
+        }
+    
+    multiplier = multipliers.get(session, 1.0)
+    return multiplier, session
 
 
 def enhance_signal_with_sentiment(signal: Dict, sentiment: Dict) -> Dict:
@@ -341,6 +387,65 @@ def enhance_signal_with_sentiment(signal: Dict, sentiment: Dict) -> Dict:
     enhanced_signal["confidence"] = confidence
 
     return enhanced_signal
+
+
+def apply_volatility_adaptation(signal: Dict, data: pd.DataFrame, config: Dict) -> Dict:
+    """
+    Apply volatility-based adjustments to signal parameters.
+    Adjusts SL, TP, and position size based on current volatility regime.
+    """
+    adapted_signal = signal.copy()
+    
+    # Get volatility regime
+    volatility = analyzer.calculate_volatility_regime(data)
+    regime = volatility.get("regime", "medium")
+    
+    # Get adaptation parameters from config
+    if "volatility_adaptation" in config and regime in config["volatility_adaptation"]:
+        adaptation = config["volatility_adaptation"][regime]
+        
+        sl_mult = adaptation.get("sl_mult", 1.0)
+        tp_mult = adaptation.get("tp_mult", 1.0)
+        size_mult = adaptation.get("size_mult", 1.0)
+        
+        # Adjust stop loss
+        entry = signal["entry"]
+        sl = signal["sl"]
+        sl_distance = abs(entry - sl)
+        new_sl_distance = sl_distance * sl_mult
+        
+        if signal["direction"].lower() == "long":
+            adapted_signal["sl"] = round(entry - new_sl_distance, 3)
+        else:
+            adapted_signal["sl"] = round(entry + new_sl_distance, 3)
+        
+        # Adjust take profit
+        tp = signal["tp"]
+        tp_distance = abs(tp - entry)
+        new_tp_distance = tp_distance * tp_mult
+        
+        if signal["direction"].lower() == "long":
+            adapted_signal["tp"] = round(entry + new_tp_distance, 3)
+        else:
+            adapted_signal["tp"] = round(entry - new_tp_distance, 3)
+        
+        # Recalculate RR
+        new_sl_dist = abs(adapted_signal["entry"] - adapted_signal["sl"])
+        new_tp_dist = abs(adapted_signal["tp"] - adapted_signal["entry"])
+        adapted_signal["rr"] = round(new_tp_dist / new_sl_dist, 2) if new_sl_dist > 0 else signal["rr"]
+        
+        # Add volatility info
+        adapted_signal["volatility_regime"] = regime
+        adapted_signal["volatility_adapted"] = True
+        adapted_signal["position_size_mult"] = size_mult
+        
+        print(f"📊 Volatility adaptation applied: {regime} regime (SL: {sl_mult}x, TP: {tp_mult}x, Size: {size_mult}x)")
+    else:
+        adapted_signal["volatility_regime"] = regime
+        adapted_signal["volatility_adapted"] = False
+        adapted_signal["position_size_mult"] = 1.0
+    
+    return adapted_signal
 
 
 def log_sentiment_analysis(data: pd.DataFrame, symbol: str = "XAU/USD"):

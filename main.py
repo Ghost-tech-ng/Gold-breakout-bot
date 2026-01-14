@@ -7,8 +7,12 @@ import json
 from datetime import datetime, timedelta
 import requests
 from breakouts import detect_breakouts
-from logger import log_trade
-from gpt_brain import get_market_sentiment, should_skip_news
+from logger import log_trade, log_position_update, log_performance_summary, log_system_event
+from gpt_brain import (get_market_sentiment, should_skip_news, 
+                       get_trading_session_multiplier, apply_volatility_adaptation)
+from position_manager import position_manager
+from risk_manager import initialize_risk_manager
+from performance_analytics import analytics
 from twelvedata import TDClient
 from collections import deque
 import pandas as pd
@@ -235,14 +239,43 @@ async def fetch_data(symbol, timeframe):
                 return None
 
             # Clean and prepare data
-            ts = ts[required_columns].copy()
-            ts["volume"] = 1000  # Placeholder volume for forex
+            # Check if volume column exists, if not fetch it separately
+            if "volume" in ts.columns:
+                ts = ts[required_columns + ["volume"]].copy()
+            else:
+                # Fetch volume data separately for forex pairs
+                try:
+                    print(f"📊 Fetching volume data for {symbol}...")
+                    volume_data = td.time_series(
+                        symbol=symbol,
+                        interval=interval,
+                        outputsize=150,
+                        timezone="UTC",
+                        order="ASC"
+                    ).with_volume().as_pandas()
+                    
+                    if not volume_data.empty and "volume" in volume_data.columns:
+                        ts = ts[required_columns].copy()
+                        # Align volume data with price data
+                        ts["volume"] = volume_data["volume"].reindex(ts.index, fill_value=0)
+                        print(f"✅ Volume data fetched successfully")
+                    else:
+                        # Fallback: Use close price changes as volume proxy
+                        ts = ts[required_columns].copy()
+                        ts["volume"] = abs(ts["close"].diff()).fillna(0) * 1000
+                        print(f"⚠️ Using price change as volume proxy")
+                except Exception as vol_error:
+                    print(f"⚠️ Could not fetch volume: {vol_error}, using price change proxy")
+                    ts = ts[required_columns].copy()
+                    ts["volume"] = abs(ts["close"].diff()).fillna(0) * 1000
+            
             ts = ts.sort_index()
             ts = ts.dropna()  # Remove any NaN values
 
             # Convert to float for precision
-            for col in required_columns:
-                ts[col] = pd.to_numeric(ts[col], errors='coerce')
+            for col in required_columns + ["volume"]:
+                if col in ts.columns:
+                    ts[col] = pd.to_numeric(ts[col], errors='coerce')
 
             print(
                 f"✅ Successfully fetched {len(ts)} candles for {symbol} ({timeframe})"
@@ -280,7 +313,7 @@ async def get_latest_prices():
 
 
 async def scan_markets():
-    """Enhanced market scanning with GPT brain integration."""
+    """Enhanced market scanning with GPT brain, session detection, and volatility adaptation."""
     if not timeframe_queue:
         return
 
@@ -291,7 +324,7 @@ async def scan_markets():
     print(f"🔍 Scanning {symbol} on {timeframe}")
 
     # Check if we should skip due to news
-    if should_skip_news():
+    if should_skip_news(config):
         print("📰 Skipping scan due to high-impact news event")
         return
 
@@ -302,33 +335,221 @@ async def scan_markets():
 
     # Get market sentiment from GPT brain
     market_sentiment = get_market_sentiment(data)
+    
+    # Get current trading session and multiplier
+    session_mult, current_session = get_trading_session_multiplier(config)
+    print(f"📊 Session: {current_session} (multiplier: {session_mult}x)")
 
     signals = detect_breakouts(data, symbol, timeframe, config)
 
     for signal in signals:
         print(
             f"🎯 Detected signal: {signal['strategy']} - {signal['direction']}")
+        
+        # Apply volatility adaptation to signal
+        signal = apply_volatility_adaptation(signal, data, config)
 
-        # Enhanced filtering with GPT brain insights
-        if (signal["rr"] >= config["min_rr"] and not signal["fakeout_detected"]
-                and market_sentiment.get("confidence", 0) > 0.6):
+        # Check position manager before processing signal
+        can_send, reason = position_manager.can_send_signal(signal, config)
+        
+        if not can_send:
+            print(f"🚫 Signal blocked by position manager: {reason}")
+            log_trade(signal, result=f"blocked_{reason}")
+            continue
+        
+        # Apply session multiplier to confidence
+        adjusted_confidence = market_sentiment.get("confidence", 0) * session_mult
 
-            send_telegram_signal(signal)
-            log_trade(signal, result="pending")
+        # Enhanced filtering with GPT brain insights, session, and volatility
+        if (signal["rr"] >= config["min_rr"] 
+                and not signal["fakeout_detected"]
+                and adjusted_confidence > 0.6):
+
+            # Add position to database
+            signal_id = position_manager.add_position(
+                signal, 
+                ml_confidence=0.0,  # Will be updated when ML is enabled
+                market_sentiment=market_sentiment.get("analysis", "")
+            )
+            
+            if signal_id:
+                # Send signal to Telegram
+                send_telegram_signal(signal)
+                log_trade(signal, result="sent", 
+                         session=current_session,
+                         volatility_regime=signal.get("volatility_regime", "unknown"))
+                print(f"✅ Signal sent and tracked: {signal_id}")
+            else:
+                print(f"❌ Failed to track position")
 
         elif signal["fakeout_detected"]:
             print(f"🚫 Fakeout detected for {signal['strategy']}")
             log_trade(signal, result="fakeout")
         else:
             print(
-                f"⚠️ Signal filtered out: RR={signal['rr']:.2f}, Confidence={market_sentiment.get('confidence', 0):.2f}"
+                f"⚠️ Signal filtered out: RR={signal['rr']:.2f}, Confidence={adjusted_confidence:.2f} (session: {session_mult}x)"
             )
 
 
+async def monitor_positions():
+    """Monitor open positions and process risk management actions."""
+    try:
+        # Get open positions
+        open_positions = position_manager.get_open_positions()
+        
+        if not open_positions:
+            return
+        
+        print(f"📊 Monitoring {len(open_positions)} open position(s)")
+        
+        # Get current data for XAU/USD
+        data = await fetch_data("XAU/USD", "M15")
+        if data is None:
+            print("⚠️ Could not fetch data for position monitoring")
+            return
+        
+        # Process each position with risk manager
+        from risk_manager import risk_manager
+        if risk_manager is None:
+            print("⚠️ Risk manager not initialized")
+            return
+        
+        actions = risk_manager.process_position_updates(open_positions, data)
+        
+        # Execute actions
+        for action in actions:
+            action_type = action['type']
+            signal_id = action['signal_id']
+            
+            if action_type == 'close_position':
+                # Close position in database
+                position_manager.update_position(
+                    signal_id,
+                    exit_price=action['exit_price'],
+                    exit_reason=action['reason']
+                )
+                
+                # Log the action
+                log_position_update(action)
+                
+                # Send Telegram notification
+                reason_emoji = "🎯" if action['reason'] == 'tp_hit' else "🛑"
+                message = f"""
+{reason_emoji} <b>POSITION CLOSED</b>
+
+📍 <b>Signal ID:</b> {signal_id[:20]}...
+💰 <b>Exit Price:</b> ${action['exit_price']:.3f}
+📊 <b>P&L:</b> ${action['pnl']:.3f}
+🔔 <b>Reason:</b> {action['reason'].replace('_', ' ').title()}
+"""
+                send_telegram_message(message)
+                
+                # Reset tracking
+                risk_manager.reset_position_tracking(signal_id)
+            
+            elif action_type == 'move_breakeven':
+                # Log the action
+                log_position_update(action)
+                
+                # Send Telegram notification
+                message = f"""
+🔒 <b>BREAKEVEN MOVE</b>
+
+📍 <b>Signal ID:</b> {signal_id[:20]}...
+📈 <b>Stop Loss:</b> ${action['old_sl']:.3f} → ${action['new_sl']:.3f}
+📊 <b>Current R:R:</b> {action['current_rr']:.2f}
+
+✅ Risk eliminated - Position now risk-free!
+"""
+                send_telegram_message(message)
+            
+            elif action_type == 'update_trailing_stop':
+                # Log the action
+                log_position_update(action)
+                
+                # Send Telegram notification
+                message = f"""
+📈 <b>TRAILING STOP UPDATE</b>
+
+📍 <b>Signal ID:</b> {signal_id[:20]}...
+🔄 <b>Stop Loss:</b> ${action['old_sl']:.3f} → ${action['new_sl']:.3f}
+📊 <b>Current R:R:</b> {action['current_rr']:.2f}
+
+🎯 Locking in profits!
+"""
+                send_telegram_message(message)
+            
+            elif action_type == 'partial_close':
+                # Log the action
+                log_position_update(action)
+                
+                # Send Telegram notification
+                message = f"""
+💰 <b>PARTIAL PROFIT TAKEN</b>
+
+📍 <b>Signal ID:</b> {signal_id[:20]}...
+📊 <b>Closed:</b> {action['percentage']}% @ ${action['exit_price']:.3f}
+💵 <b>Profit:</b> ${action['pnl']:.3f}
+
+🎯 Remaining position still active!
+"""
+                send_telegram_message(message)
+    
+    except Exception as e:
+        print(f"❌ Error monitoring positions: {e}")
+        from logger import log_error
+        log_error("position_monitoring", str(e))
+
+
+async def send_daily_summary():
+    """Send daily performance summary to Telegram."""
+    try:
+        # Get performance metrics
+        metrics = analytics.get_comprehensive_metrics(days=1)
+        
+        if metrics.get('total_trades', 0) == 0:
+            return
+        
+        # Generate report
+        report = analytics.generate_performance_report(days=1)
+        
+        # Send to Telegram
+        message = f"""
+📊 <b>DAILY PERFORMANCE SUMMARY</b>
+
+{report}
+
+🕐 <b>Report Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        send_telegram_message(message)
+        
+        # Log performance
+        log_performance_summary(metrics, period="daily")
+        
+    except Exception as e:
+        print(f"❌ Error sending daily summary: {e}")
+
+
 def run_schedule():
-    """Run the scheduler with improved timing."""
-    # Schedule every 5 minutes for better coverage
+    """Run the scheduler with improved timing and position monitoring."""
+    # Initialize risk manager
+    global risk_manager
+    risk_manager = initialize_risk_manager(config)
+    print("✅ Risk manager initialized")
+    
+    # Log system startup
+    log_system_event("startup", "Gold Breakout Bot started", {
+        "timeframes": list(timeframe_queue)
+    })
+    
+    # Schedule market scanning every 5 minutes
     schedule.every(5).minutes.do(lambda: asyncio.run(scan_markets()))
+    
+    # Schedule position monitoring every 2 minutes
+    schedule.every(2).minutes.do(lambda: asyncio.run(monitor_positions()))
+    
+    # Schedule daily summary at 23:00
+    schedule.every().day.at("23:00").do(lambda: asyncio.run(send_daily_summary()))
 
     # Get startup prices and market sentiment
     current_price, opening_price, closing_price = asyncio.run(
@@ -350,6 +571,8 @@ def run_schedule():
 
     print("🤖 Gold Breakout Bot is now running...")
     print("⏰ Scanning every 5 minutes")
+    print("📊 Monitoring positions every 2 minutes")
+    print("📈 Daily summary at 23:00")
     print("🎯 Monitoring M15, M30, H1 timeframes")
 
     while True:
