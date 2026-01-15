@@ -1,45 +1,39 @@
 {
-  "min_rr": 2.5,
+  "min_rr": 2.0,
   "sl_buffer": 1.2,
   "atr_period": 14,
   "support_resistance_window": 20,
   "pattern_window": 20,
   "volume_threshold": 1.5,
-  
-  "retest_enabled": true,
+  "retest_enabled": false,
   "retest_patience_candles": 10,
   "retest_max_distance_atr": 0.5,
-  "retest_min_quality_score": 0.6,
-  
+  "retest_min_quality_score": 0.5,
   "trailing_stop_enabled": false,
   "trailing_stop_atr_multiplier": 2.5,
   "breakeven_rr_threshold": 1.0,
   "partial_tp_enabled": false,
   "partial_tp_rr": 1.5,
   "partial_tp_percentage": 50,
-  
   "max_concurrent_positions": 3,
   "max_daily_loss_percent": 3.0,
   "max_consecutive_losses": 5,
   "position_size_reduction_after_loss": 0.5,
   "cooldown_minutes": 30,
   "min_distance_atr": 0.5,
-  
   "ml_enabled": false,
   "ml_min_confidence": 65,
   "ml_retrain_interval_days": 7,
   "ml_min_training_samples": 50,
-  
   "news_filter_enabled": false,
   "news_blackout_minutes": 30,
-  
   "session_multipliers": {
-    "asian": 0.8,
+    "asian": 0.9,
     "london": 1.0,
     "new_york": 1.1,
-    "overlap": 1.15
+    "overlap": 1.15,
+    "off_hours": 0.8
   },
-  
   "volatility_adaptation": {
     "low": {
       "sl_mult": 0.8,
@@ -57,7 +51,6 @@
       "size_mult": 0.8
     }
   },
-  
   "min_volatility_percentile": 20,
   "max_volatility_percentile": 80
 }
