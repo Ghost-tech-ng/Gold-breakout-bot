@@ -234,9 +234,9 @@ def get_trade_statistics(days: int = 7) -> Dict:
             df = df[df["timestamp"] >= cutoff]
         
         total = len(df)
-        sent = len(df[df["result"] == "sent"])
-        fakeouts = len(df[df["fakeout_detected"] == True])
-        retest_confirmed = len(df[df["retest_confirmed"] == True])
+        sent = len(df[df["result"] == "sent"]) if "result" in df.columns else 0
+        fakeouts = len(df[df.get("fakeout_detected", False) == True]) if "fakeout_detected" in df.columns else 0
+        retest_confirmed = len(df[df.get("retest_confirmed", False) == True]) if "retest_confirmed" in df.columns else 0
         
         return {
             "total_signals": total,
