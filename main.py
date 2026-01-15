@@ -366,7 +366,7 @@ async def scan_markets():
     
     # Send first scan notification with candle details
     from keep_alive import bot_status
-    if bot_status.get("total_scans", 0) == 1:  # First scan after launch
+    if bot_status.get("total_scans", 0) <= 1:  # First scan after launch (check <= 1 for timing)
         latest_candle = data.iloc[-1]
         candle_time = data.index[-1] if hasattr(data.index[-1], 'strftime') else str(data.index[-1])
         
@@ -394,6 +394,11 @@ async def scan_markets():
         send_telegram_message(message)
 
     signals = detect_breakouts(data, symbol, timeframe, config)
+    
+    # Log scan results for debugging
+    print(f"📊 Scan complete: {len(signals)} signal(s) detected on {timeframe}")
+    if len(signals) == 0:
+        print(f"ℹ️ No breakouts detected on {timeframe} - market may be consolidating")
 
     for signal in signals:
         print(
@@ -439,9 +444,16 @@ async def scan_markets():
             print(f"🚫 Fakeout detected for {signal['strategy']}")
             log_trade(signal, result="fakeout")
         else:
-            print(
-                f"⚠️ Signal filtered out: RR={signal['rr']:.2f}, Confidence={adjusted_confidence:.2f} (session: {session_mult}x)"
-            )
+            # Log detailed reason for filtering
+            reasons = []
+            if signal["rr"] < config["min_rr"]:
+                reasons.append(f"RR too low ({signal['rr']:.2f} < {config['min_rr']})")
+            if adjusted_confidence <= 0.6:
+                reasons.append(f"Low confidence ({adjusted_confidence:.2%})")
+            
+            filter_reason = ", ".join(reasons) if reasons else "Unknown"
+            print(f"⚠️ Signal filtered: {signal['strategy']} - {filter_reason}")
+            log_trade(signal, result=f"filtered_{filter_reason}")
 
 
 async def monitor_positions():
