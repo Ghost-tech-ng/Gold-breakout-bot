@@ -218,6 +218,10 @@ async def fetch_data(symbol, timeframe):
             print(
                 f"🔍 Fetching {symbol} data for {timeframe} (attempt {attempt + 1})"
             )
+            
+            # Track API call
+            from keep_alive import update_bot_status
+            update_bot_status("api_call_start", datetime.now().isoformat())
 
             # Use more specific parameters for better accuracy
             ts = td.time_series(
@@ -280,14 +284,22 @@ async def fetch_data(symbol, timeframe):
             print(
                 f"✅ Successfully fetched {len(ts)} candles for {symbol} ({timeframe})"
             )
+            
+            # Track successful API call
+            from keep_alive import update_bot_status
+            update_bot_status("api_call_success", datetime.now().isoformat())
+            
             return ts.tail(100)  # Return last 100 candles
 
         except Exception as e:
-            print(
-                f"❌ Attempt {attempt + 1} failed for {symbol} ({timeframe}): {e}"
-            )
+            print(f"❌ Error fetching data (attempt {attempt + 1}): {e}")
+            
+            # Track failed API call
+            from keep_alive import update_bot_status
+            update_bot_status("api_call_failed", str(e))
+            
             if attempt < 2:
-                await asyncio.sleep(5)  # Use asyncio.sleep for async function
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
             else:
                 return None
 

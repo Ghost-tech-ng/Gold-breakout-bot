@@ -18,7 +18,14 @@ bot_status = {
     "total_scans": 0,
     "total_signals": 0,
     "open_positions": 0,
-    "status": "running"
+    "status": "running",
+    "api_calls": {
+        "total": 0,
+        "successful": 0,
+        "failed": 0,
+        "last_call": None,
+        "last_error": None
+    }
 }
 
 
@@ -172,6 +179,19 @@ def update_bot_status(key, value):
     if key == "total_scans" and value is None:
         # Increment counter
         bot_status["total_scans"] = bot_status.get("total_scans", 0) + 1
+    elif key == "api_call_start":
+        # Track API call start
+        bot_status["api_calls"]["total"] = bot_status["api_calls"].get("total", 0) + 1
+        bot_status["api_calls"]["last_call"] = value
+    elif key == "api_call_success":
+        # Track successful API call
+        bot_status["api_calls"]["successful"] = bot_status["api_calls"].get("successful", 0) + 1
+        bot_status["api_calls"]["last_call"] = value
+        bot_status["api_calls"]["last_error"] = None  # Clear error on success
+    elif key == "api_call_failed":
+        # Track failed API call
+        bot_status["api_calls"]["failed"] = bot_status["api_calls"].get("failed", 0) + 1
+        bot_status["api_calls"]["last_error"] = value
     else:
         bot_status[key] = value
 
