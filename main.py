@@ -234,12 +234,18 @@ async def fetch_data(symbol, timeframe):
             if ts.empty:
                 print(
                     f"⚠️ Warning: No data returned for {symbol} ({timeframe})")
+                # Track failed API call (empty data)
+                from keep_alive import update_bot_status
+                update_bot_status("api_call_failed", "Empty data returned")
                 return None
 
             # Ensure we have the required columns
             required_columns = ["open", "high", "low", "close"]
             if not all(col in ts.columns for col in required_columns):
                 print(f"❌ Missing required columns for {symbol} ({timeframe})")
+                # Track failed API call (missing columns)
+                from keep_alive import update_bot_status
+                update_bot_status("api_call_failed", "Missing columns in data")
                 return None
 
             # Clean and prepare data
@@ -357,6 +363,35 @@ async def scan_markets():
     # Get current trading session and multiplier
     session_mult, current_session = get_trading_session_multiplier(config)
     print(f"📊 Session: {current_session} (multiplier: {session_mult}x)")
+    
+    # Send first scan notification with candle details
+    from keep_alive import bot_status
+    if bot_status.get("total_scans", 0) == 1:  # First scan after launch
+        latest_candle = data.iloc[-1]
+        candle_time = data.index[-1] if hasattr(data.index[-1], 'strftime') else str(data.index[-1])
+        
+        message = f"""
+📊 <b>FIRST SCAN COMPLETE</b> ✅
+
+💰 <b>Latest {symbol} Candle ({timeframe})</b>
+🕐 <b>Time:</b> {candle_time}
+
+📈 <b>OHLC Data:</b>
+   • Open: ${latest_candle['open']:.3f}
+   • High: ${latest_candle['high']:.3f}
+   • Low: ${latest_candle['low']:.3f}
+   • Close: ${latest_candle['close']:.3f}
+   • Volume: {latest_candle['volume']:.0f}
+
+📊 <b>Market Analysis:</b>
+   • Session: {current_session.title()} ({session_mult}x)
+   • Sentiment: {market_sentiment.get('analysis', 'Neutral')}
+   • Confidence: {market_sentiment.get('confidence', 0):.1%}
+
+✅ <b>Data fetching working properly!</b>
+🔍 <b>Now monitoring for breakouts...</b>
+"""
+        send_telegram_message(message)
 
     signals = detect_breakouts(data, symbol, timeframe, config)
 
