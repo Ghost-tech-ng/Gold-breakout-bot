@@ -169,7 +169,11 @@ def _calculate_uptime():
 def update_bot_status(key, value):
     """Update bot status from main.py."""
     global bot_status
-    bot_status[key] = value
+    if key == "total_scans" and value is None:
+        # Increment counter
+        bot_status["total_scans"] = bot_status.get("total_scans", 0) + 1
+    else:
+        bot_status[key] = value
 
 
 def run():

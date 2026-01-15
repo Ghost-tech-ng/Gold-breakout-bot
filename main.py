@@ -322,6 +322,12 @@ async def scan_markets():
     symbol = "XAU/USD"
 
     print(f"🔍 Scanning {symbol} on {timeframe}")
+    
+    # Update bot status
+    from keep_alive import update_bot_status
+    from datetime import datetime
+    update_bot_status("last_scan", datetime.now().isoformat())
+    update_bot_status("total_scans", None)  # Will increment in update function
 
     # Check if we should skip due to news
     if should_skip_news(config):
