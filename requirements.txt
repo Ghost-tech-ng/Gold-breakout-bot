@@ -23,3 +23,6 @@ joblib>=1.3.0
 
 # Environment Variables
 python-dotenv>=1.0.0
+
+# PostgreSQL (for Render persistent storage - set DATABASE_URL env var)
+psycopg2-binary>=2.9.0

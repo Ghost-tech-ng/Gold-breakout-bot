@@ -211,13 +211,13 @@ def enhanced_fakeout_detection(data: pd.DataFrame, signal: Dict, cfg: Dict) -> b
     # 1. Volume
     if "volume" in data.columns and data["volume"].sum() > 0:
         avg_vol = data["volume"].rolling(20).mean().iloc[-1]
-        if brk["volume"] < avg_vol * cfg.get("volume_threshold", 1.5):
+        if brk["volume"] < avg_vol * cfg.get("volume_threshold", 1.2):
             fake_signals += 1
 
     # 2. Candle body
     body = abs(brk["close"] - brk["open"])
     avg_body = abs(data["close"] - data["open"]).rolling(20).mean().iloc[-1]
-    if body < avg_body * 0.5:
+    if body < avg_body * 0.4:
         fake_signals += 1
 
     # 3. Wick
@@ -261,43 +261,102 @@ def enhanced_fakeout_detection(data: pd.DataFrame, signal: Dict, cfg: Dict) -> b
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Dynamic risk targets
+# Scalp targets (ATR-based, tight — primary for M15)
+# ────────────────────────────────────────────────────────────────────────────────
+def calculate_scalp_targets(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict[str, float]:
+    """
+    Tight ATR-based SL/TP for M15 scalping.
+    SL = entry ± ATR * sl_atr_mult (default 0.8)
+    TP = entry ± SL_distance * min_rr
+    Also considers nearest S/R level to place SL just beyond it.
+    """
+    atr = calculate_atr(data).iloc[-1]
+    entry = signal["entry"]
+    direction = signal["direction"]
+    sl_mult = cfg.get("sl_atr_mult", 0.8)
+    min_rr  = cfg.get("min_rr", 1.5)
+
+    levels = detect_support_resistance_enhanced(data)
+
+    if direction == "long":
+        # Try to anchor SL at nearest support
+        supports = [s for s in levels["support"] if s < entry]
+        if supports and (entry - max(supports)) <= atr * sl_mult * 1.5:
+            sl = max(supports) - atr * 0.15
+        else:
+            sl = entry - atr * sl_mult
+
+        sl_dist = abs(entry - sl)
+        tp = entry + sl_dist * min_rr
+
+    else:  # short
+        resistances = [r for r in levels["resistance"] if r > entry]
+        if resistances and (min(resistances) - entry) <= atr * sl_mult * 1.5:
+            sl = min(resistances) + atr * 0.15
+        else:
+            sl = entry + atr * sl_mult
+
+        sl_dist = abs(sl - entry)
+        tp = entry - sl_dist * min_rr
+
+    tp_dist = abs(tp - entry)
+    rr = tp_dist / sl_dist if sl_dist > 0 else 0
+
+    return {
+        "sl": round(sl, 3),
+        "tp": round(tp, 3),
+        "sl_distance": sl_dist,
+        "tp_distance": tp_dist,
+        "rr": round(rr, 2),
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Dynamic risk targets (S/R anchored — used for pattern breakouts)
 # ────────────────────────────────────────────────────────────────────────────────
 def calculate_dynamic_targets(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict[str, float]:
-    """Return SL/TP and their distances."""
+    """Return SL/TP anchored to nearest S/R levels, capped at 2× ATR for scalping."""
     atr_now = calculate_atr(data).iloc[-1]
     levels = detect_support_resistance_enhanced(data)
     price  = signal["entry"]
+    max_sl = atr_now * cfg.get("sl_atr_mult", 0.8) * 2  # never wider than 2× scalp SL
 
     if signal["direction"] == "long":
         supports = [s for s in levels["support"] if s < price]
         if supports:
             nearest_sup = max(supports)
-            dyn_sl = nearest_sup - atr_now * 0.5
+            dyn_sl = nearest_sup - atr_now * 0.3
         else:
-            dyn_sl = price - atr_now * cfg.get("sl_buffer", 1.5)
+            dyn_sl = price - atr_now * cfg.get("sl_buffer", 0.8)
+
+        # Cap SL distance for scalping
+        if (price - dyn_sl) > max_sl:
+            dyn_sl = price - max_sl
 
         resistances = [r for r in levels["resistance"] if r > price]
         if resistances:
             nearest_res = min(resistances)
-            dyn_tp = nearest_res - atr_now * 0.3
+            dyn_tp = nearest_res - atr_now * 0.2
         else:
-            dyn_tp = price + (price - dyn_sl) * cfg.get("min_rr", 2.0)
+            dyn_tp = price + (price - dyn_sl) * cfg.get("min_rr", 1.5)
 
     else:  # short
         resistances = [r for r in levels["resistance"] if r > price]
         if resistances:
             nearest_res = min(resistances)
-            dyn_sl = nearest_res + atr_now * 0.5
+            dyn_sl = nearest_res + atr_now * 0.3
         else:
-            dyn_sl = price + atr_now * cfg.get("sl_buffer", 1.5)
+            dyn_sl = price + atr_now * cfg.get("sl_buffer", 0.8)
+
+        if (dyn_sl - price) > max_sl:
+            dyn_sl = price + max_sl
 
         supports = [s for s in levels["support"] if s < price]
         if supports:
             nearest_sup = max(supports)
-            dyn_tp = nearest_sup + atr_now * 0.3
+            dyn_tp = nearest_sup + atr_now * 0.2
         else:
-            dyn_tp = price - (dyn_sl - price) * cfg.get("min_rr", 2.0)
+            dyn_tp = price - (dyn_sl - price) * cfg.get("min_rr", 1.5)
 
     return {
         "sl": round(dyn_sl, 3),
@@ -308,250 +367,212 @@ def calculate_dynamic_targets(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Di
 
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Breakout scanner
+# Trendline breakout detection (NEW — primary strategy)
 # ────────────────────────────────────────────────────────────────────────────────
-def detect_breakouts(
+def _find_swing_points(data: pd.DataFrame) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    """
+    Return (swing_highs, swing_lows) as lists of (bar_index, price).
+    Uses ±2 bar confirmation window.
+    """
+    swing_highs: List[Tuple[int, float]] = []
+    swing_lows:  List[Tuple[int, float]] = []
+
+    for i in range(2, len(data) - 2):
+        h = data["high"].iloc[i]
+        if (h >= data["high"].iloc[i - 1] and h >= data["high"].iloc[i + 1]
+                and h >= data["high"].iloc[i - 2] and h >= data["high"].iloc[i + 2]):
+            swing_highs.append((i, h))
+
+        l = data["low"].iloc[i]
+        if (l <= data["low"].iloc[i - 1] and l <= data["low"].iloc[i + 1]
+                and l <= data["low"].iloc[i - 2] and l <= data["low"].iloc[i + 2]):
+            swing_lows.append((i, l))
+
+    return swing_highs, swing_lows
+
+
+def detect_trendline_breakouts(
     data: pd.DataFrame,
     symbol: str,
     timeframe: str,
     cfg: Dict
 ) -> List[Dict]:
-    """Return breakout trade signals list."""
-    if len(data) < 50:
-        return []
+    """
+    Detect price breaking through a trendline:
+      • Downtrend trendline break (price was below descending highs, now closes above) → LONG
+      • Uptrend trendline break   (price was above ascending lows,  now closes below) → SHORT
 
-    atr_series = calculate_atr(data)
-    curr_atr  = atr_series.iloc[-1]
-
-    curr, prev = data.iloc[-1], data.iloc[-2]
-    levels = detect_support_resistance_enhanced(data, window=cfg.get("support_resistance_window", 20))
-    pattern_info = detect_chart_patterns_enhanced(data, window=cfg.get("pattern_window", 20))
-    trend_info   = detect_trendline_enhanced(data, window=cfg.get("pattern_window", 20))
-    bb_u, bb_m, bb_l = calculate_bollinger_bands(data)
-
-    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    Requirements for a valid trendline:
+      - At least 2 swing points that form the line
+      - R² ≥ trendline_r2_min (default 0.70) — points must align well
+      - At least trendline_min_touches (default 2) — price respected the line
+      - Breaking candle must have a real body (≥ 0.25 × ATR)
+      - SL never wider than 1.5 × ATR (keeps it a scalp)
+    """
     signals: List[Dict] = []
 
-    # 1️⃣ Support/Resistance breakouts
-    for res in levels["resistance"]:
-        if curr["close"] > res >= prev["close"] and curr["close"] > curr["open"]:
-            entry = curr["close"]
-            tgt   = calculate_dynamic_targets(data, {"entry": entry, "direction": "long"}, cfg)
-            rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
-            if rr >= cfg["min_rr"]:
-                sig = {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "strategy": "resistance_breakout",
-                    "direction": "long",
-                    "entry": round(entry, 3),
-                    "sl": tgt["sl"],
-                    "tp": tgt["tp"],
-                    "rr": round(rr, 2),
-                    "timestamp": timestamp,
-                    "fakeout_detected": False,
-                    "retest_confirmed": False,
-                    "retest_quality": 0.0,
-                    "pattern": pattern_info["pattern"],
-                    "trend_strength": trend_info["strength"],
-                    "confidence": pattern_info["confidence"],
-                }
-                sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
-                
-                # Check retest if enabled
-                retest_result = enhanced_retest_confirmation(data, sig, cfg)
-                sig["retest_confirmed"] = retest_result["confirmed"]
-                sig["retest_quality"] = retest_result["quality"]
-                
-                # Only add signal if retest confirmed (when enabled)
-                if retest_result["confirmed"]:
-                    signals.append(sig)
+    lookback = cfg.get("trendline_lookback", 60)
+    min_r2   = cfg.get("trendline_r2_min", 0.70)
+    min_tch  = cfg.get("trendline_min_touches", 2)
 
-    for sup in levels["support"]:
-        if curr["close"] < sup <= prev["close"] and curr["close"] < curr["open"]:
-            entry = curr["close"]
-            tgt   = calculate_dynamic_targets(data, {"entry": entry, "direction": "short"}, cfg)
-            rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
-            if rr >= cfg["min_rr"]:
-                sig = {
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "strategy": "support_breakout",
-                    "direction": "short",
-                    "entry": round(entry, 3),
-                    "sl": tgt["sl"],
-                    "tp": tgt["tp"],
-                    "rr": round(rr, 2),
-                    "timestamp": timestamp,
-                    "fakeout_detected": False,
-                    "retest_confirmed": False,
-                    "retest_quality": 0.0,
-                    "pattern": pattern_info["pattern"],
-                    "trend_strength": trend_info["strength"],
-                    "confidence": pattern_info["confidence"],
-                }
-                sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
-                
-                # Check retest if enabled
-                retest_result = enhanced_retest_confirmation(data, sig, cfg)
-                sig["retest_confirmed"] = retest_result["confirmed"]
-                sig["retest_quality"] = retest_result["quality"]
-                
-                # Only add signal if retest confirmed (when enabled)
-                if retest_result["confirmed"]:
-                    signals.append(sig)
+    if len(data) < 30:
+        return signals
 
-    # 2️⃣ Pattern breakouts
-    if pattern_info["pattern"] and pattern_info["confidence"] > 0.6:
-        pat = pattern_info["pattern"]
-        if "ascending" in pat and levels["resistance"]:
-            res = min(levels["resistance"])
-            if curr["close"] > res:
+    atr_series = calculate_atr(data)
+    atr = atr_series.iloc[-1]
+    if atr == 0:
+        return signals
+
+    curr = data.iloc[-1]
+    prev = data.iloc[-2]
+    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Work on a recent slice (reset index to 0-based for regression)
+    window_size = min(len(data), lookback)
+    recent = data.tail(window_size).reset_index(drop=True)
+    n = len(recent)
+
+    swing_highs, swing_lows = _find_swing_points(recent)
+
+    tolerance = atr * 0.4   # within this distance = "touching" the trendline
+    max_sl_dist = atr * 1.5  # scalp guard: SL must be tighter than 1.5 × ATR
+
+    # ── DOWNTREND LINE BREAK → LONG ─────────────────────────────────────────────
+    if len(swing_highs) >= 2:
+        pts = swing_highs[-4:] if len(swing_highs) >= 4 else swing_highs
+        x_arr = np.array([p[0] for p in pts], dtype=float)
+        y_arr = np.array([p[1] for p in pts], dtype=float)
+
+        slope, intercept, r_value, _, _ = linregress(x_arr, y_arr)
+
+        # Must be a genuine downtrend with good fit
+        if slope < -atr * 0.005 and abs(r_value) >= min_r2:
+            tl_curr = slope * (n - 1) + intercept
+            tl_prev = slope * (n - 2) + intercept
+
+            # Count how many bars respected the trendline from below
+            touches = sum(
+                1 for i in range(n)
+                if abs(recent["high"].iloc[i] - (slope * i + intercept)) <= tolerance
+                and recent["close"].iloc[i] < (slope * i + intercept)
+            )
+
+            body = abs(curr["close"] - curr["open"])
+
+            if (
+                touches >= min_tch
+                and prev["close"] <= tl_prev + tolerance      # was at/below line
+                and curr["close"] > tl_curr                    # now broke above
+                and curr["close"] > curr["open"]               # bullish candle
+                and body >= atr * 0.25                         # real body
+            ):
                 entry = curr["close"]
-                tgt   = calculate_dynamic_targets(data, {"entry": entry, "direction": "long"}, cfg)
-                rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
-                if rr >= cfg["min_rr"]:
-                    sig = {
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "strategy": f"{pat}_breakout",
-                        "direction": "long",
-                        "entry": round(entry, 3),
-                        "sl": tgt["sl"],
-                        "tp": tgt["tp"],
-                        "rr": round(rr, 2),
-                        "timestamp": timestamp,
-                        "fakeout_detected": False,
-                        "pattern": pat,
-                        "trend_strength": trend_info["strength"],
-                        "confidence": pattern_info["confidence"],
-                    }
-                    sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
-                    signals.append(sig)
+                # SL just below the broken trendline or candle low
+                sl_from_line = tl_curr - atr * 0.4
+                sl_from_low  = curr["low"] - atr * 0.15
+                sl = min(sl_from_line, sl_from_low)
+                sl_dist = abs(entry - sl)
 
-        elif "descending" in pat and levels["support"]:
-            sup = max(levels["support"])
-            if curr["close"] < sup:
+                if sl_dist <= max_sl_dist and sl_dist > 0:
+                    tp_dist = sl_dist * cfg.get("min_rr", 1.5)
+                    tp = entry + tp_dist
+                    rr = tp_dist / sl_dist
+
+                    if rr >= cfg.get("min_rr", 1.5):
+                        sig = {
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "strategy": "downtrend_line_break",
+                            "direction": "long",
+                            "entry": round(entry, 3),
+                            "sl": round(sl, 3),
+                            "tp": round(tp, 3),
+                            "rr": round(rr, 2),
+                            "timestamp": timestamp,
+                            "fakeout_detected": False,
+                            "retest_confirmed": True,
+                            "retest_quality": min(touches / max(min_tch, 4), 1.0),
+                            "pattern": "downtrend_line",
+                            "trend_strength": abs(slope) * 100,
+                            "confidence": round(abs(r_value), 3),
+                            "trendline_touches": touches,
+                        }
+                        sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
+                        signals.append(sig)
+                        print(f"📉➡️📈 Downtrend line break detected: {touches} touches, "
+                              f"R={r_value:.2f}, SL dist=${sl_dist:.2f}")
+
+    # ── UPTREND LINE BREAK → SHORT ───────────────────────────────────────────────
+    if len(swing_lows) >= 2:
+        pts = swing_lows[-4:] if len(swing_lows) >= 4 else swing_lows
+        x_arr = np.array([p[0] for p in pts], dtype=float)
+        y_arr = np.array([p[1] for p in pts], dtype=float)
+
+        slope, intercept, r_value, _, _ = linregress(x_arr, y_arr)
+
+        # Must be a genuine uptrend with good fit
+        if slope > atr * 0.005 and abs(r_value) >= min_r2:
+            tl_curr = slope * (n - 1) + intercept
+            tl_prev = slope * (n - 2) + intercept
+
+            # Count how many bars respected the trendline from above
+            touches = sum(
+                1 for i in range(n)
+                if abs(recent["low"].iloc[i] - (slope * i + intercept)) <= tolerance
+                and recent["close"].iloc[i] > (slope * i + intercept)
+            )
+
+            body = abs(curr["close"] - curr["open"])
+
+            if (
+                touches >= min_tch
+                and prev["close"] >= tl_prev - tolerance      # was at/above line
+                and curr["close"] < tl_curr                    # now broke below
+                and curr["close"] < curr["open"]               # bearish candle
+                and body >= atr * 0.25                         # real body
+            ):
                 entry = curr["close"]
-                tgt   = calculate_dynamic_targets(data, {"entry": entry, "direction": "short"}, cfg)
-                rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
-                if rr >= cfg["min_rr"]:
-                    sig = {
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "strategy": f"{pat}_breakout",
-                        "direction": "short",
-                        "entry": round(entry, 3),
-                        "sl": tgt["sl"],
-                        "tp": tgt["tp"],
-                        "rr": round(rr, 2),
-                        "timestamp": timestamp,
-                        "fakeout_detected": False,
-                        "pattern": pat,
-                        "trend_strength": trend_info["strength"],
-                        "confidence": pattern_info["confidence"],
-                    }
-                    sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
-                    signals.append(sig)
+                # SL just above the broken trendline or candle high
+                sl_from_line = tl_curr + atr * 0.4
+                sl_from_high = curr["high"] + atr * 0.15
+                sl = max(sl_from_line, sl_from_high)
+                sl_dist = abs(sl - entry)
 
-    # 3️⃣ Trend & Bollinger filtering
-    filtered = []
-    for sig in signals:
-        align = (
-            (trend_info["direction"] == "bullish" and sig["direction"] == "long")
-            or (trend_info["direction"] == "bearish" and sig["direction"] == "short")
-            or trend_info["direction"] == "neutral"
-            or trend_info["strength"] <= 3
-        )
+                if sl_dist <= max_sl_dist and sl_dist > 0:
+                    tp_dist = sl_dist * cfg.get("min_rr", 1.5)
+                    tp = entry - tp_dist
+                    rr = tp_dist / sl_dist
 
-        bb_pos = (
-            "above_upper" if curr["close"] > bb_u.iloc[-1]
-            else "below_lower" if curr["close"] < bb_l.iloc[-1]
-            else "inside"
-        )
+                    if rr >= cfg.get("min_rr", 1.5):
+                        sig = {
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "strategy": "uptrend_line_break",
+                            "direction": "short",
+                            "entry": round(entry, 3),
+                            "sl": round(sl, 3),
+                            "tp": round(tp, 3),
+                            "rr": round(rr, 2),
+                            "timestamp": timestamp,
+                            "fakeout_detected": False,
+                            "retest_confirmed": True,
+                            "retest_quality": min(touches / max(min_tch, 4), 1.0),
+                            "pattern": "uptrend_line",
+                            "trend_strength": slope * 100,
+                            "confidence": round(abs(r_value), 3),
+                            "trendline_touches": touches,
+                        }
+                        sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
+                        signals.append(sig)
+                        print(f"📈➡️📉 Uptrend line break detected: {touches} touches, "
+                              f"R={r_value:.2f}, SL dist=${sl_dist:.2f}")
 
-        if (bb_pos == "above_upper" and sig["direction"] == "long") or (
-            bb_pos == "below_lower" and sig["direction"] == "short"
-        ):
-            sig["confidence"] *= 0.8
-
-        if align and sig["confidence"] > 0.4:
-            filtered.append(sig)
-
-    return filtered
+    return signals
 
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Retest confirmation
 # ────────────────────────────────────────────────────────────────────────────────
-def confirm_retest(data: pd.DataFrame, signal: Dict) -> bool:
-    """Return True if breakout level has been retested with quality confirmation."""
-    if len(data) < 10:
-        return False
-
-    candles = data.tail(10)
-    level   = signal["entry"]
-    atr_ten = calculate_atr(data).iloc[-1]
-    tol     = atr_ten * 0.3
-    
-    retest_found = False
-    retest_quality = 0.0
-
-    for idx, (_, c) in enumerate(candles.iterrows()):
-        if signal["direction"] == "long":
-            # Check for pullback to level
-            if c["low"] <= level + tol and c["close"] > level:
-                retest_found = True
-                
-                # Quality scoring
-                # 1. Candle structure (bullish engulfing or hammer)
-                body = abs(c["close"] - c["open"])
-                lower_wick = c["open"] - c["low"] if c["close"] > c["open"] else c["close"] - c["low"]
-                if lower_wick > body * 1.5:  # Strong rejection wick
-                    retest_quality += 0.3
-                if c["close"] > c["open"]:  # Bullish candle
-                    retest_quality += 0.2
-                
-                # 2. Volume confirmation
-                if "volume" in candles.columns:
-                    avg_vol = candles["volume"].mean()
-                    if c["volume"] > avg_vol * 0.8:  # Decent volume
-                        retest_quality += 0.3
-                
-                # 3. Patience (waited at least 3 candles)
-                if idx >= 3:
-                    retest_quality += 0.2
-                
-                break
-        else:
-            # Check for pullback to level (short)
-            if c["high"] >= level - tol and c["close"] < level:
-                retest_found = True
-                
-                # Quality scoring
-                body = abs(c["close"] - c["open"])
-                upper_wick = c["high"] - c["close"] if c["close"] < c["open"] else c["high"] - c["open"]
-                if upper_wick > body * 1.5:  # Strong rejection wick
-                    retest_quality += 0.3
-                if c["close"] < c["open"]:  # Bearish candle
-                    retest_quality += 0.2
-                
-                # Volume confirmation
-                if "volume" in candles.columns:
-                    avg_vol = candles["volume"].mean()
-                    if c["volume"] > avg_vol * 0.8:
-                        retest_quality += 0.3
-                
-                # Patience
-                if idx >= 3:
-                    retest_quality += 0.2
-                
-                break
-    
-    # Return True only if retest found and quality is good (>= 0.6)
-    return retest_found and retest_quality >= 0.6
-
-
 def enhanced_retest_confirmation(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict:
     """
     Enhanced retest confirmation with detailed analysis.
@@ -559,93 +580,65 @@ def enhanced_retest_confirmation(data: pd.DataFrame, signal: Dict, cfg: Dict) ->
     """
     if not cfg.get("retest_enabled", False):
         return {"confirmed": True, "quality": 1.0, "reason": "retest_disabled"}
-    
+
     if len(data) < cfg.get("retest_patience_candles", 10):
         return {"confirmed": False, "quality": 0.0, "reason": "insufficient_data"}
-    
+
     patience_candles = cfg.get("retest_patience_candles", 10)
     max_distance_atr = cfg.get("retest_max_distance_atr", 0.5)
     min_quality = cfg.get("retest_min_quality_score", 0.6)
-    
+
     candles = data.tail(patience_candles)
     level = signal["entry"]
     atr = calculate_atr(data).iloc[-1]
     tolerance = atr * max_distance_atr
-    
+
     best_retest_quality = 0.0
     retest_candle_idx = -1
-    
+
     for idx, (_, c) in enumerate(candles.iterrows()):
         quality = 0.0
         is_retest = False
-        
+
         if signal["direction"] == "long":
-            # Long retest: price dips to level then bounces
             if c["low"] <= level + tolerance and c["close"] > level:
                 is_retest = True
-                
-                # Quality factors
                 body = abs(c["close"] - c["open"])
                 lower_wick = min(c["open"], c["close"]) - c["low"]
                 total_range = c["high"] - c["low"]
-                
-                # 1. Rejection wick (30%)
                 if total_range > 0:
-                    wick_ratio = lower_wick / total_range
-                    quality += min(wick_ratio * 0.6, 0.3)
-                
-                # 2. Bullish close (20%)
+                    quality += min((lower_wick / total_range) * 0.6, 0.3)
                 if c["close"] > c["open"]:
                     quality += 0.2
-                
-                # 3. Volume (25%)
                 if "volume" in candles.columns and candles["volume"].sum() > 0:
                     avg_vol = candles["volume"].mean()
                     vol_ratio = c["volume"] / avg_vol if avg_vol > 0 else 0
                     quality += min(vol_ratio * 0.25, 0.25)
-                
-                # 4. Patience bonus (15%)
-                patience_ratio = idx / patience_candles
-                quality += patience_ratio * 0.15
-                
-                # 5. Distance from level (10%)
+                quality += (idx / patience_candles) * 0.15
                 distance = abs(c["low"] - level)
-                distance_score = max(0, 1 - (distance / tolerance))
-                quality += distance_score * 0.1
-                
+                quality += max(0, 1 - (distance / tolerance)) * 0.1
         else:
-            # Short retest: price rises to level then drops
             if c["high"] >= level - tolerance and c["close"] < level:
                 is_retest = True
-                
                 body = abs(c["close"] - c["open"])
                 upper_wick = c["high"] - max(c["open"], c["close"])
                 total_range = c["high"] - c["low"]
-                
-                # Quality factors
                 if total_range > 0:
-                    wick_ratio = upper_wick / total_range
-                    quality += min(wick_ratio * 0.6, 0.3)
-                
+                    quality += min((upper_wick / total_range) * 0.6, 0.3)
                 if c["close"] < c["open"]:
                     quality += 0.2
-                
                 if "volume" in candles.columns and candles["volume"].sum() > 0:
                     avg_vol = candles["volume"].mean()
                     vol_ratio = c["volume"] / avg_vol if avg_vol > 0 else 0
                     quality += min(vol_ratio * 0.25, 0.25)
-                
-                patience_ratio = idx / patience_candles
-                quality += patience_ratio * 0.15
-                
+                quality += (idx / patience_candles) * 0.15
                 distance = abs(c["high"] - level)
-                distance_score = max(0, 1 - (distance / tolerance))
-                quality += distance_score * 0.1
-        
+                quality += max(0, 1 - (distance / tolerance)) * 0.1
+
         if is_retest and quality > best_retest_quality:
             best_retest_quality = quality
             retest_candle_idx = idx
-    
+
     if best_retest_quality >= min_quality:
         return {
             "confirmed": True,
@@ -670,37 +663,245 @@ def enhanced_retest_confirmation(data: pd.DataFrame, signal: Dict, cfg: Dict) ->
 
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Main breakout scanner
+# ────────────────────────────────────────────────────────────────────────────────
+def detect_breakouts(
+    data: pd.DataFrame,
+    symbol: str,
+    timeframe: str,
+    cfg: Dict
+) -> List[Dict]:
+    """
+    Return all breakout trade signals.
+
+    Sources (in priority order):
+      1. Trendline breakouts  (uptrend/downtrend line breaks)
+      2. S/R breakouts        (resistance/support level breaks)
+      3. Chart pattern breakouts (triangles, etc.)
+
+    All signals use tight ATR-based scalp targets suitable for M15.
+    """
+    if len(data) < 50:
+        return []
+
+    atr_series = calculate_atr(data)
+    curr_atr  = atr_series.iloc[-1]
+
+    curr, prev = data.iloc[-1], data.iloc[-2]
+    levels       = detect_support_resistance_enhanced(data, window=cfg.get("support_resistance_window", 20))
+    pattern_info = detect_chart_patterns_enhanced(data, window=cfg.get("pattern_window", 20))
+    trend_info   = detect_trendline_enhanced(data, window=cfg.get("pattern_window", 20))
+    bb_u, bb_m, bb_l = calculate_bollinger_bands(data)
+
+    timestamp = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    signals: List[Dict] = []
+
+    # ── 1. TRENDLINE BREAKOUTS (new primary strategy) ───────────────────────────
+    trendline_signals = detect_trendline_breakouts(data, symbol, timeframe, cfg)
+    signals.extend(trendline_signals)
+
+    # ── 2. S/R BREAKOUTS ────────────────────────────────────────────────────────
+    for res in levels["resistance"]:
+        if curr["close"] > res >= prev["close"] and curr["close"] > curr["open"]:
+            entry = curr["close"]
+            tgt   = calculate_scalp_targets(data, {"entry": entry, "direction": "long"}, cfg)
+            rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
+            if rr >= cfg["min_rr"]:
+                sig = {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "strategy": "resistance_breakout",
+                    "direction": "long",
+                    "entry": round(entry, 3),
+                    "sl": tgt["sl"],
+                    "tp": tgt["tp"],
+                    "rr": round(rr, 2),
+                    "timestamp": timestamp,
+                    "fakeout_detected": False,
+                    "retest_confirmed": False,
+                    "retest_quality": 0.0,
+                    "pattern": pattern_info["pattern"],
+                    "trend_strength": trend_info["strength"],
+                    "confidence": pattern_info["confidence"],
+                }
+                sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
+                retest_result = enhanced_retest_confirmation(data, sig, cfg)
+                sig["retest_confirmed"] = retest_result["confirmed"]
+                sig["retest_quality"] = retest_result["quality"]
+                if retest_result["confirmed"]:
+                    signals.append(sig)
+
+    for sup in levels["support"]:
+        if curr["close"] < sup <= prev["close"] and curr["close"] < curr["open"]:
+            entry = curr["close"]
+            tgt   = calculate_scalp_targets(data, {"entry": entry, "direction": "short"}, cfg)
+            rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
+            if rr >= cfg["min_rr"]:
+                sig = {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "strategy": "support_breakout",
+                    "direction": "short",
+                    "entry": round(entry, 3),
+                    "sl": tgt["sl"],
+                    "tp": tgt["tp"],
+                    "rr": round(rr, 2),
+                    "timestamp": timestamp,
+                    "fakeout_detected": False,
+                    "retest_confirmed": False,
+                    "retest_quality": 0.0,
+                    "pattern": pattern_info["pattern"],
+                    "trend_strength": trend_info["strength"],
+                    "confidence": pattern_info["confidence"],
+                }
+                sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
+                retest_result = enhanced_retest_confirmation(data, sig, cfg)
+                sig["retest_confirmed"] = retest_result["confirmed"]
+                sig["retest_quality"] = retest_result["quality"]
+                if retest_result["confirmed"]:
+                    signals.append(sig)
+
+    # ── 3. CHART PATTERN BREAKOUTS ───────────────────────────────────────────────
+    if pattern_info["pattern"] and pattern_info["confidence"] > 0.6:
+        pat = pattern_info["pattern"]
+        if "ascending" in pat and levels["resistance"]:
+            res = min(levels["resistance"])
+            if curr["close"] > res:
+                entry = curr["close"]
+                tgt   = calculate_scalp_targets(data, {"entry": entry, "direction": "long"}, cfg)
+                rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
+                if rr >= cfg["min_rr"]:
+                    sig = {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "strategy": f"{pat}_breakout",
+                        "direction": "long",
+                        "entry": round(entry, 3),
+                        "sl": tgt["sl"],
+                        "tp": tgt["tp"],
+                        "rr": round(rr, 2),
+                        "timestamp": timestamp,
+                        "fakeout_detected": False,
+                        "retest_confirmed": True,
+                        "retest_quality": pattern_info["confidence"],
+                        "pattern": pat,
+                        "trend_strength": trend_info["strength"],
+                        "confidence": pattern_info["confidence"],
+                    }
+                    sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
+                    signals.append(sig)
+
+        elif "descending" in pat and levels["support"]:
+            sup = max(levels["support"])
+            if curr["close"] < sup:
+                entry = curr["close"]
+                tgt   = calculate_scalp_targets(data, {"entry": entry, "direction": "short"}, cfg)
+                rr    = tgt["tp_distance"] / tgt["sl_distance"] if tgt["sl_distance"] else 0
+                if rr >= cfg["min_rr"]:
+                    sig = {
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "strategy": f"{pat}_breakout",
+                        "direction": "short",
+                        "entry": round(entry, 3),
+                        "sl": tgt["sl"],
+                        "tp": tgt["tp"],
+                        "rr": round(rr, 2),
+                        "timestamp": timestamp,
+                        "fakeout_detected": False,
+                        "retest_confirmed": True,
+                        "retest_quality": pattern_info["confidence"],
+                        "pattern": pat,
+                        "trend_strength": trend_info["strength"],
+                        "confidence": pattern_info["confidence"],
+                    }
+                    sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
+                    signals.append(sig)
+
+    # ── 4. TREND + BOLLINGER FILTER ─────────────────────────────────────────────
+    filtered = []
+    for sig in signals:
+        align = (
+            (trend_info["direction"] == "bullish" and sig["direction"] == "long")
+            or (trend_info["direction"] == "bearish" and sig["direction"] == "short")
+            or trend_info["direction"] == "neutral"
+            or trend_info["strength"] <= 3
+        )
+
+        # Trendline breaks are counter-trend by definition — always allow them
+        if sig["strategy"] in ("downtrend_line_break", "uptrend_line_break"):
+            align = True
+
+        bb_pos = (
+            "above_upper" if curr["close"] > bb_u.iloc[-1]
+            else "below_lower" if curr["close"] < bb_l.iloc[-1]
+            else "inside"
+        )
+
+        if (bb_pos == "above_upper" and sig["direction"] == "long") or (
+            bb_pos == "below_lower" and sig["direction"] == "short"
+        ):
+            sig["confidence"] *= 0.8
+
+        # Use a lower confidence threshold for M15 scalping
+        min_conf = cfg.get("min_signal_confidence", 0.3)
+        if align and sig["confidence"] > min_conf:
+            filtered.append(sig)
+        else:
+            reason = "trend misalign" if not align else f"conf {sig['confidence']:.2f} < {min_conf}"
+            print(f"⚠️  Signal filtered ({reason}): {sig['strategy']} {sig['direction']}")
+
+    # Deduplicate: if trendline and S/R signals overlap in direction, keep trendline
+    seen_directions = set()
+    deduped = []
+    # Put trendline signals first (higher priority)
+    for sig in sorted(filtered, key=lambda s: 0 if "line_break" in s["strategy"] else 1):
+        key = sig["direction"]
+        if key not in seen_directions:
+            seen_directions.add(key)
+            deduped.append(sig)
+
+    return deduped
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # Demo / self-test
 # ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🔍 Testing Enhanced Breakout Detection...")
+    print("🔍 Testing Enhanced Breakout Detection with Trendline Breakouts...")
 
-    # synthetic 15-minute XAU/USD data
     rng = pd.date_range("2024-01-01", periods=100, freq="15min")
     np.random.seed(42)
     base = 2000
-    trend = np.linspace(0, 50, 100)     # gentle uptrend
-    noise = np.random.normal(0, 2, 100)
+    # Downtrend then breakout
+    trend = np.concatenate([np.linspace(50, 0, 70), np.linspace(0, 30, 30)])
+    noise = np.random.normal(0, 1, 100)
 
     price = base + trend + noise
 
     df = pd.DataFrame(
         {
-            "open":  price + np.random.normal(0, 0.5, 100),
-            "high":  price + np.random.uniform(0.5, 2.0, 100),
-            "low":   price - np.random.uniform(0.5, 2.0, 100),
-            "close": price,
+            "open":   price + np.random.normal(0, 0.5, 100),
+            "high":   price + np.random.uniform(0.5, 2.0, 100),
+            "low":    price - np.random.uniform(0.5, 2.0, 100),
+            "close":  price,
             "volume": np.random.randint(1000, 5000, 100),
         },
         index=rng,
     )
 
     cfg = {
-        "min_rr": 2.0,
-        "sl_buffer": 1.5,
+        "min_rr": 1.5,
+        "sl_buffer": 0.8,
+        "sl_atr_mult": 0.8,
+        "tp_atr_mult": 1.5,
         "support_resistance_window": 20,
         "pattern_window": 20,
-        "volume_threshold": 1.5,
+        "volume_threshold": 1.2,
+        "trendline_lookback": 60,
+        "trendline_r2_min": 0.70,
+        "trendline_min_touches": 2,
+        "min_signal_confidence": 0.3,
     }
 
     sigs = detect_breakouts(df, "XAU/USD", "M15", cfg)
@@ -708,4 +909,5 @@ if __name__ == "__main__":
     print("✅ Test completed!")
     print(f"📊 Found {len(sigs)} potential breakout signal(s)")
     for s in sigs:
-        print(f"🎯 {s['strategy']} | {s['direction']} | RR {s['rr']:.2f}")
+        print(f"🎯 {s['strategy']} | {s['direction']} | Entry: {s['entry']} | "
+              f"SL: {s['sl']} | TP: {s['tp']} | RR {s['rr']:.2f}")
