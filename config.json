@@ -12,6 +12,10 @@
   "trendline_lookback": 60,
   "trendline_r2_min": 0.70,
   "trendline_min_touches": 2,
+  "measured_move_cap_atr": 4.0,
+
+  "h1_bias_filter_enabled": true,
+  "h1_bias_cache_minutes": 60,
 
   "retest_enabled": false,
   "retest_patience_candles": 10,

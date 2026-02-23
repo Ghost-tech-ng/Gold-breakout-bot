@@ -9,7 +9,8 @@ import requests
 from breakouts import detect_breakouts
 from logger import log_trade, log_position_update, log_performance_summary, log_system_event
 from gpt_brain import (get_market_sentiment, should_skip_news,
-                       get_trading_session_multiplier, apply_volatility_adaptation)
+                       get_trading_session_multiplier, apply_volatility_adaptation,
+                       determine_h1_bias)
 from position_manager import position_manager
 from risk_manager import initialize_risk_manager
 from performance_analytics import analytics
@@ -53,6 +54,9 @@ timeframe_queue = deque(["M15"])
 
 # Confidence threshold for M15 scalping (lower than before)
 CONFIDENCE_THRESHOLD = 0.5
+
+# H1 bias cache — refreshed every h1_bias_cache_minutes
+_h1_bias_cache: dict = {"bias": "ranging", "fetched_at": None}
 
 
 def send_telegram_message(message):
@@ -304,6 +308,26 @@ async def get_latest_prices():
     return None, None, None
 
 
+async def get_h1_bias() -> str:
+    """Return cached H1 bias, refreshing when the cache has expired."""
+    cache_minutes = config.get("h1_bias_cache_minutes", 60)
+    now = datetime.utcnow()
+
+    fetched_at = _h1_bias_cache.get("fetched_at")
+    if fetched_at is None or (now - fetched_at).total_seconds() > cache_minutes * 60:
+        print("🏗️ Fetching H1 data for top-down bias...")
+        h1_data = await fetch_data("XAU/USD", "H1")
+        if h1_data is not None and len(h1_data) >= 30:
+            bias = determine_h1_bias(h1_data)
+            _h1_bias_cache["bias"] = bias
+            _h1_bias_cache["fetched_at"] = now
+            print(f"🏗️ H1 bias updated: {bias.upper()}")
+        else:
+            print("⚠️ Could not fetch H1 data — keeping previous bias")
+
+    return _h1_bias_cache["bias"]
+
+
 async def scan_markets():
     """Enhanced market scanning: trendline + S/R breakouts on M15."""
     if not timeframe_queue:
@@ -329,8 +353,14 @@ async def scan_markets():
 
     market_sentiment = get_market_sentiment(data)
     session_mult, current_session = get_trading_session_multiplier(config)
+
+    # Fetch (or return cached) H1 bias for top-down analysis
+    h1_bias = await get_h1_bias()
+    bias_emoji = {"bullish": "🟢", "bearish": "🔴", "ranging": "🟡"}.get(h1_bias, "⚪")
+
     print(f"📊 Session: {current_session} (multiplier: {session_mult}x) | "
-          f"Confidence: {market_sentiment.get('confidence', 0):.2f}")
+          f"Confidence: {market_sentiment.get('confidence', 0):.2f} | "
+          f"H1 Bias: {h1_bias.upper()}")
 
     # First scan notification
     from keep_alive import bot_status
@@ -354,13 +384,14 @@ async def scan_markets():
    • Session: {current_session.title()} ({session_mult}x)
    • Sentiment: {market_sentiment.get('analysis', 'Neutral')}
    • Confidence: {market_sentiment.get('confidence', 0):.1%}
+   • {bias_emoji} H1 Bias: {h1_bias.upper()}
 
 ✅ <b>Data fetching working properly!</b>
 🔍 <b>Monitoring trendline + S/R breakouts on M15...</b>
 """
         send_telegram_message(message)
 
-    signals = detect_breakouts(data, symbol, timeframe, config)
+    signals = detect_breakouts(data, symbol, timeframe, config, h1_bias=h1_bias)
 
     print(f"📊 Scan complete: {len(signals)} signal(s) detected on {timeframe}")
     if not signals:

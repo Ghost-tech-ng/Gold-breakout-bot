@@ -474,9 +474,22 @@ def detect_trendline_breakouts(
                 sl_dist = abs(entry - sl)
 
                 if sl_dist <= max_sl_dist and sl_dist > 0:
-                    tp_dist = sl_dist * cfg.get("min_rr", 1.5)
-                    tp = entry + tp_dist
-                    rr = tp_dist / sl_dist
+                    # ── Measured Move TP ──────────────────────────────────────
+                    # Height = furthest price was BELOW the trendline within the
+                    # structure. Project that distance upward from entry.
+                    max_depth = 0.0
+                    for i in range(n):
+                        depth = (slope * i + intercept) - recent["low"].iloc[i]
+                        if depth > 0:
+                            max_depth = max(max_depth, depth)
+
+                    mm_cap    = atr * cfg.get("measured_move_cap_atr", 4.0)
+                    min_tp_dist = sl_dist * cfg.get("min_rr", 1.5)
+                    tp_dist   = max(min(max_depth, mm_cap), min_tp_dist)
+                    tp        = entry + tp_dist
+                    rr        = tp_dist / sl_dist
+                    mm_used   = max_depth > 0 and min(max_depth, mm_cap) > min_tp_dist
+                    # ──────────────────────────────────────────────────────────
 
                     if rr >= cfg.get("min_rr", 1.5):
                         sig = {
@@ -496,11 +509,14 @@ def detect_trendline_breakouts(
                             "trend_strength": abs(slope) * 100,
                             "confidence": round(abs(r_value), 3),
                             "trendline_touches": touches,
+                            "measured_move": round(max_depth, 3),
+                            "measured_move_used": mm_used,
                         }
                         sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
                         signals.append(sig)
-                        print(f"📉➡️📈 Downtrend line break detected: {touches} touches, "
-                              f"R={r_value:.2f}, SL dist=${sl_dist:.2f}")
+                        print(f"📉➡️📈 Downtrend line break: {touches} touches, "
+                              f"R={r_value:.2f}, SL=${sl_dist:.2f}, "
+                              f"TP={'measured move' if mm_used else 'min RR'} ${tp_dist:.2f}")
 
     # ── UPTREND LINE BREAK → SHORT ───────────────────────────────────────────────
     if len(swing_lows) >= 2:
@@ -539,9 +555,22 @@ def detect_trendline_breakouts(
                 sl_dist = abs(sl - entry)
 
                 if sl_dist <= max_sl_dist and sl_dist > 0:
-                    tp_dist = sl_dist * cfg.get("min_rr", 1.5)
-                    tp = entry - tp_dist
-                    rr = tp_dist / sl_dist
+                    # ── Measured Move TP ──────────────────────────────────────
+                    # Height = furthest price was ABOVE the trendline within the
+                    # structure. Project that distance downward from entry.
+                    max_height = 0.0
+                    for i in range(n):
+                        height = recent["high"].iloc[i] - (slope * i + intercept)
+                        if height > 0:
+                            max_height = max(max_height, height)
+
+                    mm_cap      = atr * cfg.get("measured_move_cap_atr", 4.0)
+                    min_tp_dist = sl_dist * cfg.get("min_rr", 1.5)
+                    tp_dist     = max(min(max_height, mm_cap), min_tp_dist)
+                    tp          = entry - tp_dist
+                    rr          = tp_dist / sl_dist
+                    mm_used     = max_height > 0 and min(max_height, mm_cap) > min_tp_dist
+                    # ──────────────────────────────────────────────────────────
 
                     if rr >= cfg.get("min_rr", 1.5):
                         sig = {
@@ -561,11 +590,14 @@ def detect_trendline_breakouts(
                             "trend_strength": slope * 100,
                             "confidence": round(abs(r_value), 3),
                             "trendline_touches": touches,
+                            "measured_move": round(max_height, 3),
+                            "measured_move_used": mm_used,
                         }
                         sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
                         signals.append(sig)
-                        print(f"📈➡️📉 Uptrend line break detected: {touches} touches, "
-                              f"R={r_value:.2f}, SL dist=${sl_dist:.2f}")
+                        print(f"📈➡️📉 Uptrend line break: {touches} touches, "
+                              f"R={r_value:.2f}, SL=${sl_dist:.2f}, "
+                              f"TP={'measured move' if mm_used else 'min RR'} ${tp_dist:.2f}")
 
     return signals
 
@@ -669,7 +701,8 @@ def detect_breakouts(
     data: pd.DataFrame,
     symbol: str,
     timeframe: str,
-    cfg: Dict
+    cfg: Dict,
+    h1_bias: str = "ranging"
 ) -> List[Dict]:
     """
     Return all breakout trade signals.
@@ -678,6 +711,10 @@ def detect_breakouts(
       1. Trendline breakouts  (uptrend/downtrend line breaks)
       2. S/R breakouts        (resistance/support level breaks)
       3. Chart pattern breakouts (triangles, etc.)
+
+    h1_bias: 'bullish' | 'bearish' | 'ranging'
+      Top-down filter — when H1 has a clear bias, only M15 signals in that
+      direction are accepted. 'ranging' allows both directions.
 
     All signals use tight ATR-based scalp targets suitable for M15.
     """
@@ -818,7 +855,19 @@ def detect_breakouts(
                     sig["fakeout_detected"] = enhanced_fakeout_detection(data, sig, cfg)
                     signals.append(sig)
 
-    # ── 4. TREND + BOLLINGER FILTER ─────────────────────────────────────────────
+    # ── 4. TOP-DOWN H1 BIAS FILTER ───────────────────────────────────────────────
+    if cfg.get("h1_bias_filter_enabled", True) and h1_bias != "ranging":
+        before = len(signals)
+        signals = [
+            s for s in signals
+            if (h1_bias == "bullish" and s["direction"] == "long")
+            or (h1_bias == "bearish" and s["direction"] == "short")
+        ]
+        blocked = before - len(signals)
+        if blocked:
+            print(f"🏗️ H1 bias ({h1_bias.upper()}) blocked {blocked} counter-trend signal(s)")
+
+    # ── 5. M15 TREND + BOLLINGER FILTER ─────────────────────────────────────────
     filtered = []
     for sig in signals:
         align = (
@@ -828,7 +877,8 @@ def detect_breakouts(
             or trend_info["strength"] <= 3
         )
 
-        # Trendline breaks are counter-trend by definition — always allow them
+        # Trendline breaks are counter-trend by definition on M15 — always allow
+        # (H1 filter above already ensured macro alignment)
         if sig["strategy"] in ("downtrend_line_break", "uptrend_line_break"):
             align = True
 

@@ -448,6 +448,70 @@ def apply_volatility_adaptation(signal: Dict, data: pd.DataFrame, config: Dict) 
     return adapted_signal
 
 
+def determine_h1_bias(data: pd.DataFrame) -> str:
+    """
+    Determine H1 trend bias for top-down analysis.
+    Returns 'bullish', 'bearish', or 'ranging'.
+
+    Uses two independent methods — both must agree for a directional bias:
+      1. SMA alignment  (price > SMA20 > SMA50 = bullish, reverse = bearish)
+      2. Swing structure (higher highs + higher lows = bullish, reverse = bearish)
+
+    If they disagree the bias is 'ranging' and M15 signals in both directions
+    are allowed.
+    """
+    if len(data) < 50:
+        return "ranging"
+
+    close = data["close"]
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+
+    price     = close.iloc[-1]
+    sma20_now = sma20.iloc[-1]
+    sma50_now = sma50.iloc[-1]
+
+    sma_bullish = price > sma20_now > sma50_now
+    sma_bearish = price < sma20_now < sma50_now
+
+    # Swing structure over last 40 bars
+    recent = data.tail(40)
+    swing_highs: List[float] = []
+    swing_lows:  List[float] = []
+
+    for i in range(2, len(recent) - 2):
+        h = recent["high"].iloc[i]
+        if (h > recent["high"].iloc[i - 1] and h > recent["high"].iloc[i + 1]
+                and h > recent["high"].iloc[i - 2] and h > recent["high"].iloc[i + 2]):
+            swing_highs.append(h)
+
+        l = recent["low"].iloc[i]
+        if (l < recent["low"].iloc[i - 1] and l < recent["low"].iloc[i + 1]
+                and l < recent["low"].iloc[i - 2] and l < recent["low"].iloc[i + 2]):
+            swing_lows.append(l)
+
+    hh_hl = False  # higher highs + higher lows → bullish structure
+    lh_ll = False  # lower  highs + lower  lows → bearish structure
+
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        hh_hl = swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]
+        lh_ll = swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]
+
+    # Both SMA alignment AND swing structure must agree
+    if sma_bullish and hh_hl:
+        return "bullish"
+    if sma_bearish and lh_ll:
+        return "bearish"
+
+    # Partial agreement — still worth noting
+    if sma_bullish or hh_hl:
+        return "bullish"   # lean bullish but weaker
+    if sma_bearish or lh_ll:
+        return "bearish"   # lean bearish but weaker
+
+    return "ranging"
+
+
 def log_sentiment_analysis(data: pd.DataFrame, symbol: str = "XAU/USD"):
     """Log sentiment analysis for future training."""
     try:
