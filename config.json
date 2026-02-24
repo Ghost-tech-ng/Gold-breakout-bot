@@ -34,6 +34,7 @@
   "max_consecutive_losses": 5,
   "position_size_reduction_after_loss": 0.5,
   "cooldown_minutes": 20,
+  "zone_lock_minutes": 60,
   "min_distance_atr": 0.3,
 
   "ml_enabled": false,

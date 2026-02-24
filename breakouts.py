@@ -279,7 +279,7 @@ def calculate_scalp_targets(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict
     levels = detect_support_resistance_enhanced(data)
 
     if direction == "long":
-        # Try to anchor SL at nearest support
+        # SL: anchor at nearest support below entry when it's close enough
         supports = [s for s in levels["support"] if s < entry]
         if supports and (entry - max(supports)) <= atr * sl_mult * 1.5:
             sl = max(supports) - atr * 0.15
@@ -287,9 +287,18 @@ def calculate_scalp_targets(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict
             sl = entry - atr * sl_mult
 
         sl_dist = abs(entry - sl)
-        tp = entry + sl_dist * min_rr
+
+        # TP: use next resistance above entry when it gives at least min_rr; else RR-based
+        resistances_above = [r for r in levels["resistance"] if r > entry]
+        min_tp = entry + sl_dist * min_rr
+        if resistances_above:
+            res_tp = min(resistances_above) - atr * 0.1   # just under the resistance level
+            tp = res_tp if res_tp >= min_tp else min_tp
+        else:
+            tp = min_tp
 
     else:  # short
+        # SL: anchor at nearest resistance above entry when it's close enough
         resistances = [r for r in levels["resistance"] if r > entry]
         if resistances and (min(resistances) - entry) <= atr * sl_mult * 1.5:
             sl = min(resistances) + atr * 0.15
@@ -297,7 +306,15 @@ def calculate_scalp_targets(data: pd.DataFrame, signal: Dict, cfg: Dict) -> Dict
             sl = entry + atr * sl_mult
 
         sl_dist = abs(sl - entry)
-        tp = entry - sl_dist * min_rr
+
+        # TP: use next support below entry when it gives at least min_rr; else RR-based
+        supports_below = [s for s in levels["support"] if s < entry]
+        min_tp = entry - sl_dist * min_rr
+        if supports_below:
+            sup_tp = max(supports_below) + atr * 0.1   # just above the support level
+            tp = sup_tp if sup_tp <= min_tp else min_tp
+        else:
+            tp = min_tp
 
     tp_dist = abs(tp - entry)
     rr = tp_dist / sl_dist if sl_dist > 0 else 0
@@ -462,9 +479,9 @@ def detect_trendline_breakouts(
             if (
                 touches >= min_tch
                 and prev["close"] <= tl_prev + tolerance      # was at/below line
-                and curr["close"] > tl_curr                    # now broke above
+                and curr["close"] > tl_curr + atr * 0.1       # meaningful close above, not marginal
                 and curr["close"] > curr["open"]               # bullish candle
-                and body >= atr * 0.25                         # real body
+                and body >= atr * 0.3                          # solid body (strengthened from 0.25)
             ):
                 entry = curr["close"]
                 # SL just below the broken trendline or candle low
@@ -543,9 +560,9 @@ def detect_trendline_breakouts(
             if (
                 touches >= min_tch
                 and prev["close"] >= tl_prev - tolerance      # was at/above line
-                and curr["close"] < tl_curr                    # now broke below
+                and curr["close"] < tl_curr - atr * 0.1       # meaningful close below, not marginal
                 and curr["close"] < curr["open"]               # bearish candle
-                and body >= atr * 0.25                         # real body
+                and body >= atr * 0.3                          # solid body (strengthened from 0.25)
             ):
                 entry = curr["close"]
                 # SL just above the broken trendline or candle high
@@ -856,16 +873,20 @@ def detect_breakouts(
                     signals.append(sig)
 
     # ── 4. TOP-DOWN H1 BIAS FILTER ───────────────────────────────────────────────
+    # Trendline breakouts bypass this filter — they carry their own structural
+    # validation (R², touches, body size) and can fire in either direction.
+    # Only S/R and chart-pattern breakouts are restricted by H1 bias.
     if cfg.get("h1_bias_filter_enabled", True) and h1_bias != "ranging":
         before = len(signals)
         signals = [
             s for s in signals
-            if (h1_bias == "bullish" and s["direction"] == "long")
+            if s["strategy"] in ("downtrend_line_break", "uptrend_line_break")
+            or (h1_bias == "bullish" and s["direction"] == "long")
             or (h1_bias == "bearish" and s["direction"] == "short")
         ]
         blocked = before - len(signals)
         if blocked:
-            print(f"🏗️ H1 bias ({h1_bias.upper()}) blocked {blocked} counter-trend signal(s)")
+            print(f"🏗️ H1 bias ({h1_bias.upper()}) blocked {blocked} counter-trend S/R signal(s)")
 
     # ── 5. M15 TREND + BOLLINGER FILTER ─────────────────────────────────────────
     filtered = []

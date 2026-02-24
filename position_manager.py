@@ -37,7 +37,9 @@ class PositionManager:
 
             # Check 2: Cooldown period
             cooldown_minutes = config.get("cooldown_minutes", 30)
-            cooldown_time = (datetime.now() - timedelta(minutes=cooldown_minutes)).isoformat()
+            # IMPORTANT: must use same strftime format as stored timestamps ("YYYY-MM-DD HH:MM:SS")
+            # isoformat() produces "T" separator which compares wrong in SQLite string comparison
+            cooldown_time = (datetime.now() - timedelta(minutes=cooldown_minutes)).strftime("%Y-%m-%d %H:%M:%S")
 
             cur.execute(q("""
                 SELECT COUNT(*) FROM signal_history
@@ -48,7 +50,23 @@ class PositionManager:
             if recent_signals > 0:
                 return False, f"Cooldown active (last signal < {cooldown_minutes} min ago)"
 
-            # Check 3: Price proximity to existing positions
+            # Check 3: Zone lock — block re-entry in same direction at similar price
+            # Prevents the bot from repeatedly entering a failed breakout zone
+            zone_minutes = config.get("zone_lock_minutes", 60)
+            zone_time = (datetime.now() - timedelta(minutes=zone_minutes)).strftime("%Y-%m-%d %H:%M:%S")
+            sl_dist = abs(signal['entry'] - signal['sl'])
+
+            cur.execute(q("""
+                SELECT price_level FROM signal_history
+                WHERE symbol = ? AND direction = ? AND timestamp > ?
+            """), (signal['symbol'], signal['direction'], zone_time))
+
+            recent_zone = cur.fetchall()
+            for (prev_price,) in recent_zone:
+                if abs(signal['entry'] - float(prev_price)) < sl_dist * 2.5:
+                    return False, f"Zone locked: recent {signal['direction']} signal at similar price within {zone_minutes}min"
+
+            # Check 4: Price proximity to existing positions
             min_distance_atr = config.get("min_distance_atr", 0.5)
             cur.execute(q("""
                 SELECT entry_price, stop_loss FROM positions
@@ -63,7 +81,7 @@ class PositionManager:
                 if abs(signal['entry'] - entry_price) < min_distance:
                     return False, f"Too close to existing position (< {min_distance_atr} ATR)"
 
-            # Check 4: Daily loss limit
+            # Check 5: Daily loss limit
             max_daily_loss = config.get("max_daily_loss_percent", 3.0)
             today = datetime.now().strftime("%Y-%m-%d")
 
@@ -77,7 +95,7 @@ class PositionManager:
                 if daily_pnl < -(max_daily_loss * 100):
                     return False, f"Daily loss limit reached ({daily_pnl:.2f})"
 
-            # Check 5: Consecutive losses
+            # Check 6: Consecutive losses
             max_consecutive_losses = config.get("max_consecutive_losses", 5)
             cur.execute(q("""
                 SELECT consecutive_losses FROM performance_metrics WHERE date = ?
