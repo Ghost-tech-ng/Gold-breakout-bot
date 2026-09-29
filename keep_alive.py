@@ -1,218 +1,83 @@
-"""
-Enhanced Flask Server for Render Deployment
-Provides health checks, statistics, and manual scan endpoints.
-"""
+"""Small Flask server so Render keeps the worker up, plus read-only status endpoints."""
 
-from flask import Flask, jsonify, request
-from threading import Thread
-import os
-from datetime import datetime
+from __future__ import annotations
+
 import json
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from threading import Thread
+from typing import Any
 
+from flask import Flask, Response, jsonify
+
+log = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# Store bot status
-bot_status = {
-    "started_at": datetime.now().isoformat(),
-    "last_scan": None,
-    "total_scans": 0,
-    "total_signals": 0,
-    "open_positions": 0,
-    "status": "running",
-    "api_calls": {
-        "total": 0,
-        "successful": 0,
-        "failed": 0,
-        "last_call": None,
-        "last_error": None
-    }
+STALE_AFTER = timedelta(hours=2, minutes=15)
+
+bot_status: dict[str, Any] = {
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "runs": 0,
+    "last_success": None,
+    "last_error": None,
+    "consecutive_failures": 0,
+    "regime": None,
 }
 
 
-@app.route('/')
-def home():
-    """Basic health check endpoint."""
-    return jsonify({
-        "status": "alive",
-        "service": "Gold Breakout Bot",
-        "uptime": _calculate_uptime(),
-        "timestamp": datetime.now().isoformat()
-    })
+def update_bot_status(**fields: Any) -> None:
+    bot_status.update(fields)
 
 
-@app.route('/health')
-def health():
-    """Detailed health check for monitoring."""
+@app.route("/")
+def home() -> Response:
+    return jsonify({"status": "alive", "service": "Gold trend signal bot", "started_at": bot_status["started_at"]})
+
+
+@app.route("/health")
+def health() -> tuple[Response, int]:
+    from trend import store
+
+    checks: dict[str, str] = {}
     try:
-        # Check if database exists
-        db_exists = os.path.exists("trade_history.db")
-        
-        # Check if config exists
-        config_exists = os.path.exists("config.json")
-        
-        health_status = {
-            "status": "healthy" if db_exists and config_exists else "degraded",
-            "checks": {
-                "database": "ok" if db_exists else "missing",
-                "config": "ok" if config_exists else "missing",
-                "uptime": _calculate_uptime()
-            },
-            "bot_status": bot_status,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        return jsonify(health_status), 200 if health_status["status"] == "healthy" else 503
-    
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
+        checks["database"] = "ok" if store.ping() else "error"
+    except Exception as exc:
+        checks["database"] = f"error: {exc}"
+
+    last = bot_status["last_success"]
+    started = datetime.fromisoformat(bot_status["started_at"])
+    reference = datetime.fromisoformat(last) if last else started
+    checks["engine"] = "ok" if datetime.now(timezone.utc) - reference < STALE_AFTER else "stale"
+
+    healthy = all(v == "ok" for v in checks.values())
+    return jsonify({"status": "healthy" if healthy else "degraded", "checks": checks,
+                    "bot_status": bot_status}), 200 if healthy else 503
 
 
-@app.route('/stats')
-def stats():
-    """Get bot statistics and performance metrics."""
+@app.route("/stats")
+def stats() -> tuple[Response, int]:
+    from trend import store
+
     try:
-        from position_manager import position_manager
-        from performance_analytics import analytics
-        
-        # Get open positions
-        open_positions = position_manager.get_open_positions()
-        
-        # Get performance metrics (last 7 days)
-        try:
-            metrics = analytics.get_comprehensive_metrics(days=7)
-        except:
-            metrics = {"error": "No trade data available"}
-        
-        # Get recent trade log stats
-        from logger import get_trade_statistics
-        trade_stats = get_trade_statistics(days=7)
-        
-        return jsonify({
-            "bot_status": bot_status,
-            "open_positions_count": len(open_positions),
-            "open_positions": open_positions[:5],  # Limit to 5 for response size
-            "performance_7d": metrics,
-            "signal_stats_7d": trade_stats,
-            "timestamp": datetime.now().isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
+        state = store.load_state() or {}
+        return jsonify({"open_positions": state.get("positions", {}), "totals": store.totals(),
+                        "recent_trades": store.recent_trades(20), "bot_status": bot_status}), 200
+    except Exception as exc:
+        log.exception("stats failed")
+        return jsonify({"error": str(exc)}), 500
 
 
-@app.route('/scan', methods=['POST'])
-def manual_scan():
-    """Trigger a manual market scan (requires authentication)."""
+@app.route("/config")
+def get_config() -> tuple[Response, int]:
     try:
-        # Simple authentication via header or query param
-        auth_token = request.headers.get('X-Auth-Token') or request.args.get('token')
-        expected_token = os.getenv('MANUAL_SCAN_TOKEN', 'change-me-in-production')
-        
-        if auth_token != expected_token:
-            return jsonify({
-                "error": "Unauthorized",
-                "message": "Invalid or missing authentication token"
-            }), 401
-        
-        # Trigger scan (this would need to be implemented in main.py)
-        return jsonify({
-            "status": "scan_triggered",
-            "message": "Manual scan initiated",
-            "timestamp": datetime.now().isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
+        with open("config.json", encoding="utf-8") as f:
+            return jsonify(json.load(f)), 200
+    except (OSError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
-@app.route('/config')
-def get_config():
-    """Get current bot configuration (sanitized)."""
-    try:
-        with open('config.json', 'r') as f:
-            config = json.load(f)
-        
-        # Remove sensitive data if any
-        sanitized_config = {k: v for k, v in config.items() 
-                           if k not in ['api_key', 'secret', 'password']}
-        
-        return jsonify({
-            "config": sanitized_config,
-            "timestamp": datetime.now().isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 500
-
-
-def _calculate_uptime():
-    """Calculate bot uptime."""
-    try:
-        start_time = datetime.fromisoformat(bot_status["started_at"])
-        uptime = datetime.now() - start_time
-        
-        days = uptime.days
-        hours, remainder = divmod(uptime.seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        return f"{days}d {hours}h {minutes}m {seconds}s"
-    except:
-        return "unknown"
-
-
-def update_bot_status(key, value):
-    """Update bot status from main.py."""
-    global bot_status
-    if key == "total_scans" and value is None:
-        # Increment counter
-        bot_status["total_scans"] = bot_status.get("total_scans", 0) + 1
-    elif key == "api_call_start":
-        # Track API call start
-        bot_status["api_calls"]["total"] = bot_status["api_calls"].get("total", 0) + 1
-        bot_status["api_calls"]["last_call"] = value
-    elif key == "api_call_success":
-        # Track successful API call
-        bot_status["api_calls"]["successful"] = bot_status["api_calls"].get("successful", 0) + 1
-        bot_status["api_calls"]["last_call"] = value
-        bot_status["api_calls"]["last_error"] = None  # Clear error on success
-    elif key == "api_call_failed":
-        # Track failed API call
-        bot_status["api_calls"]["failed"] = bot_status["api_calls"].get("failed", 0) + 1
-        bot_status["api_calls"]["last_error"] = value
-    else:
-        bot_status[key] = value
-
-
-def run():
-    """Run Flask server."""
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
-
-
-def keep_alive():
-    """Start Flask server in background thread."""
-    print(f"🌐 Starting web server on port {os.getenv('PORT', 5000)}...")
-    t = Thread(target=run, daemon=True)
-    t.start()
-    print("✅ Web server started")
-
-
-if __name__ == '__main__':
-    # For testing
-    keep_alive()
-    import time
-    while True:
-        time.sleep(1)
+def keep_alive() -> None:
+    port = int(os.getenv("PORT", "5000"))
+    Thread(target=lambda: app.run(host="0.0.0.0", port=port, debug=False), daemon=True).start()
+    log.info("Web server listening on port %s", port)

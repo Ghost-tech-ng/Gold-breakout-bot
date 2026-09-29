@@ -57,61 +57,27 @@ def q(sql: str) -> str:
 
 
 def init_db():
-    """Create all tables if they do not already exist."""
+    """Create the tables the signal engine needs if they do not already exist."""
     with get_db() as (conn, cur):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
         cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS positions (
+            CREATE TABLE IF NOT EXISTS trend_trades (
                 id {AUTOINC},
-                signal_id TEXT UNIQUE NOT NULL,
-                symbol TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                stop_loss REAL NOT NULL,
-                take_profit REAL NOT NULL,
-                risk_reward REAL NOT NULL,
+                book TEXT NOT NULL,
                 entry_time TEXT NOT NULL,
-                status TEXT NOT NULL,
-                exit_price REAL,
-                exit_time TEXT,
-                pnl REAL,
-                exit_reason TEXT,
-                ml_confidence REAL,
-                market_sentiment TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS signal_history (
-                id {AUTOINC},
-                symbol TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                strategy TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                price_level REAL NOT NULL,
-                timestamp TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS performance_metrics (
-                id {AUTOINC},
-                date TEXT NOT NULL,
-                total_trades INTEGER DEFAULT 0,
-                winning_trades INTEGER DEFAULT 0,
-                losing_trades INTEGER DEFAULT 0,
-                total_pnl REAL DEFAULT 0.0,
-                win_rate REAL DEFAULT 0.0,
-                avg_rr REAL DEFAULT 0.0,
-                max_drawdown REAL DEFAULT 0.0,
-                consecutive_losses INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL,
-                UNIQUE(date)
+                exit_time TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL NOT NULL,
+                r REAL NOT NULL,
+                UNIQUE(book, entry_time)
             )
         """)
 
     db_type = 'PostgreSQL' if IS_POSTGRES else 'SQLite'
-    print(f"✅ Database initialized ({db_type})")
+    print(f"Database initialized ({db_type})")
